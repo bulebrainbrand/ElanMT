@@ -1,0 +1,6 @@
+# One Japanese test sentence per line. Lines starting with # are ignored.
+こんにちは。私はAIです。
+お元気ですか？
+今日はいい天気ですね。
+東京は日本の首都です。
+このモデルは日本語を英語に翻訳します。

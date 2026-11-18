@@ -1,0 +1,157 @@
+{
+  "created_at": "2026-11-18T10:44:46+00:00",
+  "model_dir": "model",
+  "settings": {
+    "device": "cpu",
+    "compute_dtype": "float32",
+    "num_beams": 4,
+    "max_new_tokens": 128,
+    "max_source_tokens": 512
+  },
+  "sentences": [
+    {
+      "id": 0,
+      "source": "こんにちは。私はAIです。",
+      "source_truncated": false,
+      "output_token_ids": [
+        14696,
+        110,
+        7,
+        77,
+        27,
+        132,
+        56,
+        3,
+        4208,
+        7,
+        0
+      ],
+      "output_tokens": [
+        "▁Hell",
+        "o",
+        ".",
+        "▁I",
+        "'",
+        "m",
+        "▁an",
+        "▁",
+        "AI",
+        ".",
+        "</s>"
+      ],
+      "translation": "Hello. I'm an AI."
+    },
+    {
+      "id": 1,
+      "source": "お元気ですか？",
+      "source_truncated": false,
+      "output_token_ids": [
+        4583,
+        55,
+        206,
+        5654,
+        142,
+        0
+      ],
+      "output_tokens": [
+        "▁How",
+        "▁are",
+        "▁you",
+        "▁doing",
+        "?",
+        "</s>"
+      ],
+      "translation": "How are you doing?"
+    },
+    {
+      "id": 2,
+      "source": "今日はいい天気ですね。",
+      "source_truncated": false,
+      "output_token_ids": [
+        88,
+        27,
+        9,
+        15,
+        21704,
+        491,
+        5,
+        8163,
+        27,
+        72,
+        48,
+        142,
+        0
+      ],
+      "output_tokens": [
+        "▁It",
+        "'",
+        "s",
+        "▁a",
+        "▁nice",
+        "▁day",
+        ",",
+        "▁isn",
+        "'",
+        "t",
+        "▁it",
+        "?",
+        "</s>"
+      ],
+      "translation": "It's a nice day, isn't it?"
+    },
+    {
+      "id": 3,
+      "source": "東京は日本の首都です。",
+      "source_truncated": false,
+      "output_token_ids": [
+        1649,
+        25,
+        2,
+        1358,
+        8,
+        272,
+        7,
+        0
+      ],
+      "output_tokens": [
+        "▁Tokyo",
+        "▁is",
+        "▁the",
+        "▁capital",
+        "▁of",
+        "▁Japan",
+        ".",
+        "</s>"
+      ],
+      "translation": "Tokyo is the capital of Japan."
+    },
+    {
+      "id": 4,
+      "source": "このモデルは日本語を英語に翻訳します。",
+      "source_truncated": false,
+      "output_token_ids": [
+        134,
+        1175,
+        24210,
+        9,
+        314,
+        133,
+        1173,
+        7,
+        0
+      ],
+      "output_tokens": [
+        "▁This",
+        "▁model",
+        "▁translate",
+        "s",
+        "▁Japanese",
+        "▁into",
+        "▁English",
+        ".",
+        "</s>"
+      ],
+      "translation": "This model translates Japanese into English."
+    }
+  ]
+}
