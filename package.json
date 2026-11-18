@@ -1,15 +1,28 @@
 {
   "name": "ElanMT",
   "version": "1.0.0",
-  "description": "",
-  "main": "index.js",
-  "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
-  },
+  "description": "Dependency-free TypeScript inference for Mitsua/elan-mt-bt-ja-en (Marian ja-en)",
   "keywords": [],
-  "author": "",
   "license": "ISC",
+  "author": "",
+  "type": "module",
+  "main": "remote/index.js",
+  "scripts": {
+    "build": "vp pack src/index.ts && vp pack src/bloxd/index.ts -d remote/bloxd",
+    "build:dense": "vp pack src/index.ts",
+    "build:world": "vp pack src/bloxd/index.ts -d remote/bloxd",
+    "export:weights": "python scripts/export_blockdata.py",
+    "export:text": "node scripts/createSafe8Text.ts",
+    "export:schem": "node scripts/createWeightSchematics.ts",
+    "export:blockdata": "npm run export:weights && npm run export:text && npm run export:schem",
+    "infer": "node scripts/infer_ts.mjs",
+    "check": "vp check",
+    "test": "node --test test/safe8.test.mjs test/blockdata.test.mjs",
+    "emulate": "node scripts/vm_emulate.mjs"
+  },
   "devDependencies": {
+    "@bloxdjs/schematic": "^0.1.4",
+    "@types/node": "^26.6.2",
     "vite-plus": "^1.7.0"
   }
 }
