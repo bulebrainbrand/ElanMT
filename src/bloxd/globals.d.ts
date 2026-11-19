@@ -33,6 +33,7 @@ declare global {
       ) => void)
     | undefined;
   var setTickBudget: ((bytes: number) => void) | undefined;
+  var setLoadBudget: ((bytes: number) => void) | undefined;
 }
 
 export {};

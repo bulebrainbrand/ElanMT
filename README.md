@@ -13,8 +13,10 @@ Dense 版は HF `MarianMTModel` とトークン単位で一致します。int8 /
 量子化重みで行い、tick ごとのバイト予算内で少しずつ進めます。
 
 **Bloxd runtime は TypedArray / ArrayBuffer / DataView / Buffer を使いません。**
-重みは 32bit word（4バイト）単位の `number[]` にパックし、2MiB（524,288要素）ごとの
-`number[][]` に分割して保持します。41MB の重みを単一の巨大配列にはしません。トークナイザも `number[]` と手書きの float32 デコードで動きます。
+int4 の重みは、0..255 を1文字に格納した **Latin-1 文字列**を 512KiB ごとの
+`string[]` に分割して保持します。V8 では1文字1バイトなので、`number[]` に
+32bit word を入れるより小さくなります。int8 版は blockdata をストリームし、
+トークナイザ・活性化・ロジットは `number[]` と手書きの float32 デコードで動きます。
 （Dense 版は Node/ブラウザ専用なので `Float32Array` を使っています。Bloxd bundle には
 含まれません。）
 
@@ -83,11 +85,12 @@ think("こんにちは。私はAIです。", (tokens, promptLength) => {
 ```
 
 最初の `think()` で 41MB を blockdata から読み、`number[]` の 32bit word に詰めて
-メモリに保持します。以降はメモリ上の重みだけで推論します。int4 版の既定 tick 予算は
-64 MiB です。
+メモリに保持します。読み込みは **1 MiB/tick** に分割され、約40 tick かけて進みます
+（推論用の tick 予算とは別枠）。以降はメモリ上の重みだけで推論します。
 
 ```js
-setTickBudget(16 * 1024 * 1024); // 必要なら変更
+setTickBudget(64 * 1024 * 1024); // 推論の1tick予算
+setLoadBudget(1024 * 1024); // 重み読み込みの1tick予算（既定1MiB）
 ```
 
 ### int8（ストリーム）
@@ -138,16 +141,37 @@ int4 の実行例（短文、200MiB 制限）:
   "variant": "int4-memory",
   "decoded": "Hello. I'm an AI.",
   "tokens": [14696, 110, 7, 77, 27, 132, 56, 3, 4208, 7, 0],
-  "ticks": 6,
-  "elapsedMs": 2481,
-  "second": { "ticks": 5, "elapsedMs": 1628 },
+  "ticks": 44,
+  "elapsedMs": 2798,
+  "second": { "ticks": 5, "elapsedMs": 1828 },
   "memoryLimitMb": 200,
-  "memory": { "rssMb": 190, "heapUsedMb": 123, "heapTotalMb": 138 }
+  "memory": { "rssMb": 147, "heapUsedMb": 74, "heapTotalMb": 89 }
 }
 ```
 
 `second` は同じモデルを再利用した2回目です。重みの再読み込みがないことを確認できます。
-int8 版は同じ文で 57 ticks / 約8.2秒、int4 版は 6 ticks / 約2.5秒です。
+int4 の初回は「読み込み約39 ticks + 推論5 ticks」、2回目は推論5 ticks です。
+int8 版は同じ文で 57 ticks / 約8.2秒、int4 版は初回 44 ticks / 約2.8秒です。
+
+### RSS が約150MBになる理由
+
+41MB は **ファイル上の生バイト数** です。int4 版はこれを Latin-1 文字列
+（1文字1バイト）として持つため、重みの実データは約41MBです。`number[]` に
+32bit word を入れる方式では、x64 V8 の1スロットが8バイト（Smi でも double でも
+同じ）になり、重みだけで約82MB、RSS は約190MBでした。文字列方式では
+RSS 約147MB / heapUsed 約74MB まで下がっています。
+
+- 重み（Latin-1 文字列 512KiB × 約79チャンク）: 約41MB
+- トークナイザ（SentencePiece の Darts 配列・vocab）: 約5MB
+- 推論中の logits・活性化・beam: 約20MB
+- Node / vm コンテキスト・コード: 約30–40MB
+- 合計 RSS: 約147MB（`heapTotal` は約89MB）
+
+文字列は `String.fromCharCode` で構築し、`charCodeAt` で読みます。Bloxd の
+JS エンジンが 0..255 の文字列を1バイトで保持する場合はこの削減が効きます。
+2バイト文字列として保持するエンジンでは、`number[][]` 方式と同等以上に
+なる可能性があります。`loadWeightsIntoMemory()` / `MemoryCursor` の
+`number[][]` 方式もフォールバックとして残しています。
 512トークン級の長文は計算量が大きいため、実運用では短い文に分けるのが現実的です。
 
 ## 精度
@@ -177,7 +201,8 @@ src/
     index.ts          int8 world code 入口（ストリーム）
     int4.ts           int4 world code 入口（起動時メモリロード）
     memory.ts         重みの一括ロードと in-memory 推論
-    memoryCursor.ts   32bit word の number[][] チャンクによる重みカーソル
+    stringCursor.ts   Latin-1 文字列チャンクによる重みカーソル
+    memoryCursor.ts   32bit word の number[][] チャンク（フォールバック）
     byteCursor.ts     safe8 を blockdata から読むカーソル（number[]）
     blockdata.ts      api.getBlockData / setBlockData ラッパー
     loadChunk.ts      未ロードチャンク待ち

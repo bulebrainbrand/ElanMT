@@ -8,13 +8,13 @@
 
 import { ByteCursor } from "./byteCursor";
 import { CHUNK_SIZE } from "./constants";
-import { queueTask, setTickBudget, update as updateEventLoop } from "./eventLoop";
+import { queueTask, setLoadBudget, setTickBudget, update as updateEventLoop } from "./eventLoop";
 import { translateBlock } from "./generate";
 import { update as updateChunkLoads } from "./loadChunk";
 import { BlockMarian } from "./marian";
-import { loadWeightsIntoMemory, translateInt4Bytes as translateBytes } from "./memory";
+import { loadWeightsAsStrings, translateInt4Bytes as translateBytes } from "./memory";
 import type { MemoryCallbacks } from "./memory";
-import { MemoryCursor } from "./memoryCursor";
+import { StringCursor } from "./stringCursor";
 import { MODEL_CONFIG as INT4_CONFIG, MODEL_WEIGHTS as INT4_WEIGHTS } from "./manifestInt4";
 import { loadTokenizer } from "./tokenizerBlock";
 import { createWeightCoordFn } from "./weightCoordFn";
@@ -26,18 +26,19 @@ const sourceCursor = new ByteCursor(CHUNK_SIZE, createWeightCoordFn(INT4_ORIGIN)
 
 // In-memory reads are cheap, so allow more work per tick than the streaming
 // int8 path. The caller can still override this with setTickBudget().
-setTickBudget(8 * 1024 * 1024);
-let memoryCursor: MemoryCursor | undefined;
+setTickBudget(64 * 1024 * 1024);
+setLoadBudget(1024 * 1024);
+let memoryCursor: StringCursor | undefined;
 let model: BlockMarian | undefined;
 let loading = false;
-const waiting: ((model: BlockMarian, cursor: MemoryCursor) => void)[] = [];
+const waiting: ((model: BlockMarian, cursor: StringCursor) => void)[] = [];
 
 globalThis.tick = () => {
   updateChunkLoads();
   updateEventLoop();
 };
 
-function ensureModel(callback: (model: BlockMarian, cursor: MemoryCursor) => void): void {
+function ensureModel(callback: (model: BlockMarian, cursor: StringCursor) => void): void {
   if (model !== undefined && memoryCursor !== undefined) {
     callback(model, memoryCursor);
     return;
@@ -49,7 +50,7 @@ function ensureModel(callback: (model: BlockMarian, cursor: MemoryCursor) => voi
   if (totalLength === undefined || totalLength <= 0) {
     throw new Error("int4 manifest is missing totalLength");
   }
-  loadWeightsIntoMemory(sourceCursor, totalLength, (cursor) => {
+  loadWeightsAsStrings(sourceCursor, totalLength, (cursor) => {
     memoryCursor = cursor;
     const loaded = new BlockMarian(cursor, INT4_CONFIG, INT4_WEIGHTS);
     loaded.prepare(() => {
@@ -115,6 +116,7 @@ globalThis.think = ((
 }) as typeof globalThis.think;
 
 globalThis.setTickBudget = setTickBudget;
+globalThis.setLoadBudget = setLoadBudget;
 
 function translateInt4Bytes(
   bytes: number[],

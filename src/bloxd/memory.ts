@@ -1,8 +1,9 @@
 import type { WeightCursor } from "./byteCursor";
-import { queueTask, update as updateEventLoop } from "./eventLoop";
+import { queueTask, spendLoad, update as updateEventLoop } from "./eventLoop";
 import { translateBlock } from "./generate";
 import { BlockMarian } from "./marian";
-import { MemoryCursor, WORD_CHUNK_MASK, WORD_CHUNK_SHIFT, packBytesToWords } from "./memoryCursor";
+import { MemoryCursor, WORD_CHUNK_MASK, WORD_CHUNK_SHIFT } from "./memoryCursor";
+import { StringCursor, bytesToLatin1, bytesToStrings } from "./stringCursor";
 import { loadTokenizer } from "./tokenizerBlock";
 import type { ModelConfig, ModelWeights } from "./types";
 
@@ -48,7 +49,7 @@ export function loadWeightsIntoMemory(
           const chunkIndex = wordIndex >>> WORD_CHUNK_SHIFT;
           let chunk = words[chunkIndex];
           if (chunk === undefined) {
-            chunk = [];
+            chunk = new Array<number>(1 << WORD_CHUNK_SHIFT).fill(0);
             words[chunkIndex] = chunk;
           }
           const b1 = i + 1 < length ? temp[i + 1] : 0;
@@ -56,6 +57,49 @@ export function loadWeightsIntoMemory(
           const b3 = i + 3 < length ? temp[i + 3] : 0;
           chunk[wordIndex & WORD_CHUNK_MASK] = (temp[i] ?? 0) | (b1 << 8) | (b2 << 16) | (b3 << 24);
         }
+        spendLoad(length);
+        queueTask(next);
+      },
+      0,
+      true,
+    );
+  };
+  next();
+}
+
+/** Read the whole stream into Latin-1 string chunks, one buffer per task. */
+export function loadWeightsAsStrings(
+  cursor: WeightCursor,
+  totalLengthOrWeights: number | ModelWeights,
+  callback: (cursor: StringCursor) => void,
+): void {
+  const totalLength =
+    typeof totalLengthOrWeights === "number"
+      ? totalLengthOrWeights
+      : (totalLengthOrWeights.totalLength ?? Number.NaN);
+  if (!Number.isFinite(totalLength) || totalLength <= 0) {
+    throw new RangeError(`invalid weight length: ${String(totalLength)}`);
+  }
+  const strings: string[] = [];
+  const chunkSize = 512 * 1024;
+  const temp = new Array<number>(chunkSize).fill(0);
+  let offset = 0;
+  const next = (): void => {
+    if (offset >= totalLength) {
+      callback(new StringCursor(strings, totalLength));
+      return;
+    }
+    console.log(offset);
+    const length = Math.min(chunkSize, totalLength - offset);
+    const start = offset;
+    offset += length;
+    cursor.readBytesInto(
+      temp,
+      start,
+      length,
+      () => {
+        strings.push(bytesToLatin1(temp, length));
+        spendLoad(length);
         queueTask(next);
       },
       0,
@@ -71,7 +115,7 @@ export function loadWeightsIntoMemory(
  * generator can spread its work across game ticks.
  */
 export function translateInMemory(
-  cursor: MemoryCursor,
+  cursor: WeightCursor,
   config: ModelConfig,
   weights: ModelWeights,
   text: string,
@@ -111,7 +155,7 @@ export function translateInt4Bytes(
   maxNewTokens = 32,
 ): void {
   translateInMemory(
-    new MemoryCursor(packBytesToWords(bytes), bytes.length),
+    new StringCursor(bytesToStrings(bytes), bytes.length),
     config,
     weights,
     text,

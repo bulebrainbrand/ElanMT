@@ -51,19 +51,32 @@ function readData(pos, callback) {
 * can be frozen inside one tick, so the scheduler charges bytes decoded from
 * block data instead of measuring time. Every ByteCursor read reports its size
 * through spend(); update() stops starting new tasks once the tick's budget is
-* exhausted. A task already running always finishes, so the worst case is
-* budget + the largest single task.
+* exhausted. Bulk loading uses a separate spendLoad() budget so reading the
+* full weight stream is split over many ticks instead of consuming the whole
+* inference budget at once. A task already running always finishes, so the
+* worst case is budget + the largest single task.
 */
 const TASK_OVERHEAD = 1024;
-let tickByteBudget = 8388608;
+const DEFAULT_TICK_BYTE_BUDGET = 8388608;
+const DEFAULT_LOAD_BYTE_BUDGET = 1048576;
+let tickByteBudget = DEFAULT_TICK_BYTE_BUDGET;
+let loadByteBudget = DEFAULT_LOAD_BYTE_BUDGET;
 let spent = 0;
+let loadSpent = 0;
 const queue = [];
 const setTickBudget = (bytes) => {
 	if (!Number.isFinite(bytes) || bytes < 1) throw new RangeError(`Tick budget must be a positive number: ${bytes}`);
 	tickByteBudget = Math.floor(bytes);
 };
+const setLoadBudget = (bytes) => {
+	if (!Number.isFinite(bytes) || bytes < 1) throw new RangeError(`Load budget must be a positive number: ${bytes}`);
+	loadByteBudget = Math.floor(bytes);
+};
 const spend = (bytes) => {
 	spent += bytes;
+};
+const spendLoad = (bytes) => {
+	loadSpent += bytes;
 };
 const queueTask = (task) => {
 	queue.push(task);
@@ -71,7 +84,7 @@ const queueTask = (task) => {
 const update = () => {
 	let head = 0;
 	try {
-		while (head < queue.length && spent < tickByteBudget) {
+		while (head < queue.length && spent < tickByteBudget && loadSpent < loadByteBudget) {
 			const task = queue[head];
 			try {
 				spent += TASK_OVERHEAD;
@@ -82,6 +95,7 @@ const update = () => {
 		}
 	} finally {
 		spent = 0;
+		loadSpent = 0;
 		if (head > 0) {
 			let write = 0;
 			for (let read = head; read < queue.length; read++) queue[write++] = queue[read];
@@ -864,21 +878,19 @@ function addVectors(a, b) {
 	for (let i = 0; i < a.length; i++) out[i] = Math.fround(a[i] - -b[i]);
 	return out;
 }
-const WORD_CHUNK_MASK = 524287;
-/** Pack a byte-like sequence into 32-bit word chunks. */
-function packBytesToWords(bytes) {
-	const words = [];
-	for (let i = 0; i < bytes.length; i += 4) {
-		const wordIndex = i >>> 2;
-		const chunkIndex = wordIndex >>> 19;
-		let chunk = words[chunkIndex];
-		if (chunk === void 0) {
-			chunk = [];
-			words[chunkIndex] = chunk;
-		}
-		chunk[wordIndex & WORD_CHUNK_MASK] = (bytes[i] ?? 0) | (bytes[i + 1] ?? 0) << 8 | (bytes[i + 2] ?? 0) << 16 | (bytes[i + 3] ?? 0) << 24;
+const STRING_CHUNK_SIZE = 1 << 19;
+const STRING_CHUNK_MASK = 524287;
+const BUILD_PART = 8192;
+/** Decode 0..255 bytes into a flat Latin-1 string. */
+function bytesToLatin1(bytes, length = bytes.length, start = 0) {
+	const parts = [];
+	for (let i = 0; i < length; i += BUILD_PART) {
+		const end = Math.min(i + BUILD_PART, length);
+		const sub = [];
+		for (let j = i; j < end; j++) sub.push(bytes[start + j] ?? 0);
+		parts.push(String.fromCharCode.apply(null, sub));
 	}
-	return words;
+	return parts.join("");
 }
 function float32FromBits(bits) {
 	const sign = bits & 2147483648 ? -1 : 1;
@@ -891,46 +903,37 @@ function float32FromBits(bits) {
 	if (exponent === 255) return fraction === 0 ? sign * Infinity : NaN;
 	return sign * (1 + fraction * 2 ** -23) * 2 ** (exponent - 127);
 }
-/** Weight source backed by 32-bit words split into bounded number[] chunks. */
-var MemoryCursor = class {
-	words;
+/** Weight source backed by Latin-1 strings. */
+var StringCursor = class {
+	strings;
 	byteLength;
-	constructor(words, byteLength) {
-		this.words = words;
+	constructor(strings, byteLength) {
+		this.strings = strings;
 		this.byteLength = byteLength;
 	}
-	wordAt(wordIndex) {
-		const chunk = this.words[wordIndex >>> 19];
-		return chunk === void 0 ? 0 : chunk[wordIndex & WORD_CHUNK_MASK];
-	}
-	byteAt(index) {
-		return this.wordAt(index >>> 2) >>> (index & 3) * 8 & 255;
+	byteAt(offset) {
+		const chunk = this.strings[offset >>> 19];
+		return chunk === void 0 ? 0 : chunk.charCodeAt(offset & STRING_CHUNK_MASK);
 	}
 	readBytesInto(out, tensorOffset, length, callback, outBase = 0, unsigned = false) {
 		if (length < 0 || outBase < 0 || length > out.length - outBase) throw new RangeError(`readBytesInto range [${outBase}, ${outBase + length}) exceeds buffer ${out.length}`);
 		if (tensorOffset < 0 || tensorOffset + length > this.byteLength) throw new RangeError(`readBytesInto range [${tensorOffset}, ${tensorOffset + length}) exceeds weights`);
 		let i = 0;
-		if ((tensorOffset & 3) === 0) for (; i + 4 <= length; i += 4) {
-			const word = this.wordAt(tensorOffset + i >>> 2);
-			const b0 = word & 255;
-			const b1 = word >>> 8 & 255;
-			const b2 = word >>> 16 & 255;
-			const b3 = word >>> 24 & 255;
-			if (unsigned) {
-				out[outBase + i] = b0;
-				out[outBase + i + 1] = b1;
-				out[outBase + i + 2] = b2;
-				out[outBase + i + 3] = b3;
-			} else {
-				out[outBase + i] = b0 << 24 >> 24;
-				out[outBase + i + 1] = b1 << 24 >> 24;
-				out[outBase + i + 2] = b2 << 24 >> 24;
-				out[outBase + i + 3] = b3 << 24 >> 24;
+		while (i < length) {
+			const absolute = tensorOffset + i;
+			const chunkIndex = absolute >>> 19;
+			const chunk = this.strings[chunkIndex];
+			if (chunk === void 0) {
+				for (; i < length; i++) out[outBase + i] = 0;
+				break;
 			}
-		}
-		for (; i < length; i++) {
-			const byte = this.byteAt(tensorOffset + i);
-			out[outBase + i] = unsigned ? byte : byte << 24 >> 24;
+			const local = absolute & STRING_CHUNK_MASK;
+			const run = Math.min(length - i, STRING_CHUNK_SIZE - local);
+			for (let j = 0; j < run; j++) {
+				const byte = chunk.charCodeAt(local + j);
+				out[outBase + i + j] = unsigned ? byte : byte << 24 >> 24;
+			}
+			i += run;
 		}
 		spend(length);
 		callback();
@@ -947,11 +950,8 @@ var MemoryCursor = class {
 		const values = new Array(count).fill(0);
 		for (let i = 0; i < count; i++) {
 			const o = tensorOffset + i * 4;
-			if ((o & 3) === 0) values[i] = float32FromBits(this.wordAt(o >>> 2) >>> 0);
-			else {
-				const bits = (this.byteAt(o) | this.byteAt(o + 1) << 8 | this.byteAt(o + 2) << 16 | this.byteAt(o + 3) << 24) >>> 0;
-				values[i] = float32FromBits(bits);
-			}
+			const bits = (this.byteAt(o) | this.byteAt(o + 1) << 8 | this.byteAt(o + 2) << 16 | this.byteAt(o + 3) << 24) >>> 0;
+			values[i] = float32FromBits(bits);
 		}
 		spend(count * 4);
 		callback(values);
@@ -1375,17 +1375,17 @@ function loadTokenizer(cursor, weights, eosId, callback) {
 	});
 }
 // src/bloxd/memory.ts
-/** Read the whole stream into 512 KiB tasks and 2 MiB word chunks. */
-function loadWeightsIntoMemory(cursor, totalLengthOrWeights, callback) {
+/** Read the whole stream into Latin-1 string chunks, one buffer per task. */
+function loadWeightsAsStrings(cursor, totalLengthOrWeights, callback) {
 	const totalLength = typeof totalLengthOrWeights === "number" ? totalLengthOrWeights : totalLengthOrWeights.totalLength ?? NaN;
 	if (!Number.isFinite(totalLength) || totalLength <= 0) throw new RangeError(`invalid weight length: ${String(totalLength)}`);
-	const words = [];
+	const strings = [];
 	const chunkSize = 524288;
 	const temp = new Array(chunkSize).fill(0);
 	let offset = 0;
 	const next = () => {
 		if (offset >= totalLength) {
-			callback(new MemoryCursor(words, totalLength));
+			callback(new StringCursor(strings, totalLength));
 			return;
 		}
 		console.log(offset);
@@ -1393,50 +1393,12 @@ function loadWeightsIntoMemory(cursor, totalLengthOrWeights, callback) {
 		const start = offset;
 		offset += length;
 		cursor.readBytesInto(temp, start, length, () => {
-			const wordStart = start >>> 2;
-			for (let i = 0; i < length; i += 4) {
-				const wordIndex = wordStart + (i >>> 2);
-				const chunkIndex = wordIndex >>> 19;
-				let chunk = words[chunkIndex];
-				if (chunk === void 0) {
-					chunk = [];
-					words[chunkIndex] = chunk;
-				}
-				const b1 = i + 1 < length ? temp[i + 1] : 0;
-				const b2 = i + 2 < length ? temp[i + 2] : 0;
-				const b3 = i + 3 < length ? temp[i + 3] : 0;
-				chunk[wordIndex & WORD_CHUNK_MASK] = (temp[i] ?? 0) | b1 << 8 | b2 << 16 | b3 << 24;
-			}
+			strings.push(bytesToLatin1(temp, length));
+			spendLoad(length);
 			queueTask(next);
 		}, 0, true);
 	};
 	next();
-}
-/**
-* Run one translation against an in-memory weight cursor. The event-loop
-* queue is drained synchronously; Bloxd instead calls tick() so the same
-* generator can spread its work across game ticks.
-*/
-function translateInMemory(cursor, config, weights, text, callbacks = {}, maxNewTokens = 32) {
-	const model = new BlockMarian(cursor, config, weights);
-	let finished = false;
-	model.prepare(() => {
-		loadTokenizer(cursor, weights, config.eosId, (tokenizer) => {
-			translateBlock(model, tokenizer, text, {
-				onToken: (tokens, decoded) => callbacks.onToken?.(tokens, decoded),
-				onComplete: (tokens, sourceTokens) => {
-					const decoded = tokenizer.decode(tokens);
-					callbacks.onComplete?.(tokens, sourceTokens.length, decoded);
-					finished = true;
-				}
-			}, { maxNewTokens });
-			while (!finished) update();
-		});
-	});
-}
-/** Node convenience wrapper: bytes are the raw weights_*.bin file. */
-function translateInt4Bytes$1(bytes, config, weights, text, callbacks = {}, maxNewTokens = 32) {
-	translateInMemory(new MemoryCursor(packBytesToWords(bytes), bytes.length), config, weights, text, callbacks, maxNewTokens);
 }
 // src/bloxd/manifestInt4.ts
 const MODEL_CONFIG = {
@@ -4559,7 +4521,8 @@ const sourceCursor = new ByteCursor(CHUNK_SIZE, createWeightCoordFn([
 	1,
 	64
 ]));
-setTickBudget(8388608);
+setTickBudget(67108864);
+setLoadBudget(1048576);
 let memoryCursor;
 let model;
 let loading = false;
@@ -4578,7 +4541,7 @@ function ensureModel(callback) {
 	loading = true;
 	const totalLength = MODEL_WEIGHTS.totalLength;
 	if (totalLength === void 0 || totalLength <= 0) throw new Error("int4 manifest is missing totalLength");
-	loadWeightsIntoMemory(sourceCursor, totalLength, (cursor) => {
+	loadWeightsAsStrings(sourceCursor, totalLength, (cursor) => {
 		memoryCursor = cursor;
 		const loaded = new BlockMarian(cursor, MODEL_CONFIG, MODEL_WEIGHTS);
 		loaded.prepare(() => {
@@ -4618,7 +4581,4 @@ globalThis.think = ((text, callbacks, _stream = true, maxNewTokens = 32) => {
 	} }, maxNewTokens);
 });
 globalThis.setTickBudget = setTickBudget;
-function translateInt4Bytes(bytes, text, callbacks = {}, maxNewTokens = 32) {
-	translateInt4Bytes$1(bytes, MODEL_CONFIG, MODEL_WEIGHTS, text, callbacks, maxNewTokens);
-}
-export { translateInt4Bytes };
+globalThis.setLoadBudget = setLoadBudget;

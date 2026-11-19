@@ -1,27 +1,36 @@
 import type { WeightCursor } from "./byteCursor";
 import { spend } from "./eventLoop";
 
-/** 524,288 32-bit words = 2 MiB per number[] chunk. */
+/** 524,288 32-bit words per number[] chunk. */
 export const WORD_CHUNK_SHIFT = 19;
 export const WORD_CHUNK_SIZE = 1 << WORD_CHUNK_SHIFT;
 export const WORD_CHUNK_MASK = WORD_CHUNK_SIZE - 1;
+
+function chunkFor(words: number[][], wordIndex: number): number[] {
+  const chunkIndex = wordIndex >>> WORD_CHUNK_SHIFT;
+  let chunk = words[chunkIndex];
+  if (chunk === undefined) {
+    chunk = new Array<number>(WORD_CHUNK_SIZE).fill(0);
+    words[chunkIndex] = chunk;
+  }
+  return chunk;
+}
+
+/** Write one 32-bit word into the chunked number[] stream. */
+function writePackedWord(words: number[][], wordIndex: number, word: number): void {
+  chunkFor(words, wordIndex)[wordIndex & WORD_CHUNK_MASK] = word;
+}
 
 /** Pack a byte-like sequence into 32-bit word chunks. */
 export function packBytesToWords(bytes: ArrayLike<number>): number[][] {
   const words: number[][] = [];
   for (let i = 0; i < bytes.length; i += 4) {
-    const wordIndex = i >>> 2;
-    const chunkIndex = wordIndex >>> WORD_CHUNK_SHIFT;
-    let chunk = words[chunkIndex];
-    if (chunk === undefined) {
-      chunk = [];
-      words[chunkIndex] = chunk;
-    }
-    chunk[wordIndex & WORD_CHUNK_MASK] =
+    const word =
       (bytes[i] ?? 0) |
       ((bytes[i + 1] ?? 0) << 8) |
       ((bytes[i + 2] ?? 0) << 16) |
       ((bytes[i + 3] ?? 0) << 24);
+    writePackedWord(words, i >>> 2, word);
   }
   return words;
 }

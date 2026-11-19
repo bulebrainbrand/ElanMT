@@ -31,12 +31,18 @@ const update$1 = () => {
 * can be frozen inside one tick, so the scheduler charges bytes decoded from
 * block data instead of measuring time. Every ByteCursor read reports its size
 * through spend(); update() stops starting new tasks once the tick's budget is
-* exhausted. A task already running always finishes, so the worst case is
-* budget + the largest single task.
+* exhausted. Bulk loading uses a separate spendLoad() budget so reading the
+* full weight stream is split over many ticks instead of consuming the whole
+* inference budget at once. A task already running always finishes, so the
+* worst case is budget + the largest single task.
 */
 const TASK_OVERHEAD = 1024;
-let tickByteBudget = 8388608;
+const DEFAULT_TICK_BYTE_BUDGET = 8388608;
+const DEFAULT_LOAD_BYTE_BUDGET = 1048576;
+let tickByteBudget = DEFAULT_TICK_BYTE_BUDGET;
+let loadByteBudget = DEFAULT_LOAD_BYTE_BUDGET;
 let spent = 0;
+let loadSpent = 0;
 const queue = [];
 const setTickBudget = (bytes) => {
 	if (!Number.isFinite(bytes) || bytes < 1) throw new RangeError(`Tick budget must be a positive number: ${bytes}`);
@@ -52,7 +58,7 @@ const queueTask = (task) => {
 const update = () => {
 	let head = 0;
 	try {
-		while (head < queue.length && spent < tickByteBudget) {
+		while (head < queue.length && spent < tickByteBudget && loadSpent < loadByteBudget) {
 			const task = queue[head];
 			try {
 				spent += TASK_OVERHEAD;
@@ -63,6 +69,7 @@ const update = () => {
 		}
 	} finally {
 		spent = 0;
+		loadSpent = 0;
 		if (head > 0) {
 			let write = 0;
 			for (let read = head; read < queue.length; read++) queue[write++] = queue[read];
