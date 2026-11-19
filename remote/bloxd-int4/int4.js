@@ -62,7 +62,6 @@ const setTickBudget = (bytes) => {
 	if (!Number.isFinite(bytes) || bytes < 1) throw new RangeError(`Tick budget must be a positive number: ${bytes}`);
 	tickByteBudget = Math.floor(bytes);
 };
-const getTickBudget = () => tickByteBudget;
 const spend = (bytes) => {
 	spent += bytes;
 };
@@ -1376,7 +1375,7 @@ function loadTokenizer(cursor, weights, eosId, callback) {
 	});
 }
 // src/bloxd/memory.ts
-/** Read the whole weight stream into packed 32-bit words, one MiB per task. */
+/** Read the whole stream into 512 KiB tasks and 2 MiB word chunks. */
 function loadWeightsIntoMemory(cursor, totalLengthOrWeights, callback) {
 	const totalLength = typeof totalLengthOrWeights === "number" ? totalLengthOrWeights : totalLengthOrWeights.totalLength ?? NaN;
 	if (!Number.isFinite(totalLength) || totalLength <= 0) throw new RangeError(`invalid weight length: ${String(totalLength)}`);
@@ -1389,6 +1388,7 @@ function loadWeightsIntoMemory(cursor, totalLengthOrWeights, callback) {
 			callback(new MemoryCursor(words, totalLength));
 			return;
 		}
+		console.log(offset);
 		const length = Math.min(chunkSize, totalLength - offset);
 		const start = offset;
 		offset += length;
@@ -4554,14 +4554,12 @@ function createWeightCoordFn(origin = WEIGHT_ORIGIN) {
 * read once into a number[], then every layer runs from memory; tick() only
 * has to advance the generator queue, not fetch weights again.
 */
-/** int4 weights live on the z=64 layer, away from the int8 copy at z=32. */
-const INT4_ORIGIN = [
+const sourceCursor = new ByteCursor(CHUNK_SIZE, createWeightCoordFn([
 	0,
 	1,
 	64
-];
-const sourceCursor = new ByteCursor(CHUNK_SIZE, createWeightCoordFn(INT4_ORIGIN));
-setTickBudget(67108864);
+]));
+setTickBudget(8388608);
 let memoryCursor;
 let model;
 let loading = false;
@@ -4593,7 +4591,9 @@ function ensureModel(callback) {
 function think(text, callbacks = {}, maxNewTokens = 32) {
 	queueTask(() => {
 		ensureModel((loaded, cursor) => {
+			console.log("model loaded");
 			loadTokenizer(cursor, MODEL_WEIGHTS, MODEL_CONFIG.eosId, (tokenizer) => {
+				console.log("tokenizer loaded");
 				translateBlock(loaded, tokenizer, text, {
 					onToken: (tokens, decoded) => callbacks.onToken?.(tokens, decoded),
 					onComplete: (tokens, sourceTokens) => {
@@ -4621,4 +4621,4 @@ globalThis.setTickBudget = setTickBudget;
 function translateInt4Bytes(bytes, text, callbacks = {}, maxNewTokens = 32) {
 	translateInt4Bytes$1(bytes, MODEL_CONFIG, MODEL_WEIGHTS, text, callbacks, maxNewTokens);
 }
-export { BlockMarian, ByteCursor, MODEL_CONFIG as INT4_CONFIG, INT4_ORIGIN, MODEL_WEIGHTS as INT4_WEIGHTS, MemoryCursor, getTickBudget, loadWeightsIntoMemory, setTickBudget, think, translateInt4Bytes, update };
+export { translateInt4Bytes };

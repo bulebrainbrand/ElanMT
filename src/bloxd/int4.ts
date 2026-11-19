@@ -20,13 +20,13 @@ import { loadTokenizer } from "./tokenizerBlock";
 import { createWeightCoordFn } from "./weightCoordFn";
 
 /** int4 weights live on the z=64 layer, away from the int8 copy at z=32. */
-export const INT4_ORIGIN = [0, 1, 64] as const;
+const INT4_ORIGIN = [0, 1, 64] as const;
 
 const sourceCursor = new ByteCursor(CHUNK_SIZE, createWeightCoordFn(INT4_ORIGIN));
 
 // In-memory reads are cheap, so allow more work per tick than the streaming
 // int8 path. The caller can still override this with setTickBudget().
-setTickBudget(64 * 1024 * 1024);
+setTickBudget(8 * 1024 * 1024);
 let memoryCursor: MemoryCursor | undefined;
 let model: BlockMarian | undefined;
 let loading = false;
@@ -60,15 +60,17 @@ function ensureModel(callback: (model: BlockMarian, cursor: MemoryCursor) => voi
   });
 }
 
-export interface ThinkCallbacks {
+interface ThinkCallbacks {
   onToken?: (tokens: number[], text: string) => void;
   onComplete?: (tokens: number[], promptLength: number, text: string) => void;
 }
 
-export function think(text: string, callbacks: ThinkCallbacks = {}, maxNewTokens = 32): void {
+function think(text: string, callbacks: ThinkCallbacks = {}, maxNewTokens = 32): void {
   queueTask(() => {
     ensureModel((loaded, cursor) => {
+      console.log("model loaded");
       loadTokenizer(cursor, INT4_WEIGHTS, INT4_CONFIG.eosId, (tokenizer) => {
+        console.log("tokenizer loaded");
         translateBlock(
           loaded,
           tokenizer,
@@ -114,7 +116,7 @@ globalThis.think = ((
 
 globalThis.setTickBudget = setTickBudget;
 
-export function translateInt4Bytes(
+function translateInt4Bytes(
   bytes: number[],
   text: string,
   callbacks: MemoryCallbacks = {},
@@ -122,8 +124,3 @@ export function translateInt4Bytes(
 ): void {
   translateBytes(bytes, INT4_CONFIG, INT4_WEIGHTS, text, callbacks, maxNewTokens);
 }
-
-export { BlockMarian, ByteCursor, INT4_CONFIG, INT4_WEIGHTS, MemoryCursor };
-export type { MemoryCallbacks };
-export { loadWeightsIntoMemory } from "./memory";
-export { getTickBudget, setTickBudget, update } from "./eventLoop";

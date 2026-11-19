@@ -33,6 +33,7 @@ export function loadWeightsIntoMemory(
       callback(new MemoryCursor(words, totalLength));
       return;
     }
+    console.log(offset);
     const length = Math.min(chunkSize, totalLength - offset);
     const start = offset;
     offset += length;
