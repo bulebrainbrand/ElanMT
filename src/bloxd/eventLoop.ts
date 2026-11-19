@@ -33,9 +33,6 @@ export const queueTask = (task: () => void): void => {
   queue.push(task);
 };
 
-/** Backwards-compatible alias used by the reference implementation. */
-export const queueGenerator = queueTask;
-
 export const update = (): void => {
   let head = 0;
   try {
