@@ -1,22 +1,29 @@
 import type { WeightCursor } from "./byteCursor";
 import { spend } from "./eventLoop";
 
-/** Pack a byte-like sequence into 32-bit words. */
-export function packBytesToWords(bytes: ArrayLike<number>): number[] {
-  const words = new Array<number>(Math.ceil(bytes.length / 4)).fill(0);
-  for (let i = 0; i < words.length; i++) {
-    const o = i * 4;
-    words[i] =
-      (bytes[o] ?? 0) |
-      ((bytes[o + 1] ?? 0) << 8) |
-      ((bytes[o + 2] ?? 0) << 16) |
-      ((bytes[o + 3] ?? 0) << 24);
+/** 524,288 32-bit words = 2 MiB per number[] chunk. */
+export const WORD_CHUNK_SHIFT = 19;
+export const WORD_CHUNK_SIZE = 1 << WORD_CHUNK_SHIFT;
+export const WORD_CHUNK_MASK = WORD_CHUNK_SIZE - 1;
+
+/** Pack a byte-like sequence into 32-bit word chunks. */
+export function packBytesToWords(bytes: ArrayLike<number>): number[][] {
+  const words: number[][] = [];
+  for (let i = 0; i < bytes.length; i += 4) {
+    const wordIndex = i >>> 2;
+    const chunkIndex = wordIndex >>> WORD_CHUNK_SHIFT;
+    let chunk = words[chunkIndex];
+    if (chunk === undefined) {
+      chunk = [];
+      words[chunkIndex] = chunk;
+    }
+    chunk[wordIndex & WORD_CHUNK_MASK] =
+      (bytes[i] ?? 0) |
+      ((bytes[i + 1] ?? 0) << 8) |
+      ((bytes[i + 2] ?? 0) << 16) |
+      ((bytes[i + 3] ?? 0) << 24);
   }
   return words;
-}
-
-function float32FromWord(word: number): number {
-  return float32FromBits(word >>> 0);
 }
 
 function float32FromBits(bits: number): number {
@@ -31,22 +38,23 @@ function float32FromBits(bits: number): number {
   return sign * (1 + fraction * 2 ** -23) * 2 ** (exponent - 127);
 }
 
-function float32FromBytes(b0: number, b1: number, b2: number, b3: number): number {
-  return float32FromBits((b0 | (b1 << 8) | (b2 << 16) | (b3 << 24)) >>> 0);
-}
-
-/** Weight source backed by 32-bit words (4 packed bytes) in a plain number[]. */
+/** Weight source backed by 32-bit words split into bounded number[] chunks. */
 export class MemoryCursor implements WeightCursor {
-  readonly words: number[];
+  readonly words: number[][];
   readonly byteLength: number;
 
-  constructor(words: number[], byteLength: number) {
+  constructor(words: number[][], byteLength: number) {
     this.words = words;
     this.byteLength = byteLength;
   }
 
+  private wordAt(wordIndex: number): number {
+    const chunk = this.words[wordIndex >>> WORD_CHUNK_SHIFT];
+    return chunk === undefined ? 0 : chunk[wordIndex & WORD_CHUNK_MASK];
+  }
+
   private byteAt(index: number): number {
-    return (this.words[index >>> 2] >>> ((index & 3) * 8)) & 0xff;
+    return (this.wordAt(index >>> 2) >>> ((index & 3) * 8)) & 0xff;
   }
 
   readBytesInto(
@@ -70,7 +78,7 @@ export class MemoryCursor implements WeightCursor {
     let i = 0;
     if ((tensorOffset & 3) === 0) {
       for (; i + 4 <= length; i += 4) {
-        const word = this.words[(tensorOffset + i) >>> 2];
+        const word = this.wordAt((tensorOffset + i) >>> 2);
         const b0 = word & 0xff;
         const b1 = (word >>> 8) & 0xff;
         const b2 = (word >>> 16) & 0xff;
@@ -111,14 +119,15 @@ export class MemoryCursor implements WeightCursor {
     for (let i = 0; i < count; i++) {
       const o = tensorOffset + i * 4;
       if ((o & 3) === 0) {
-        values[i] = float32FromWord(this.words[o >>> 2]);
+        values[i] = float32FromBits(this.wordAt(o >>> 2) >>> 0);
       } else {
-        values[i] = float32FromBytes(
-          this.byteAt(o),
-          this.byteAt(o + 1),
-          this.byteAt(o + 2),
-          this.byteAt(o + 3),
-        );
+        const bits =
+          (this.byteAt(o) |
+            (this.byteAt(o + 1) << 8) |
+            (this.byteAt(o + 2) << 16) |
+            (this.byteAt(o + 3) << 24)) >>>
+          0;
+        values[i] = float32FromBits(bits);
       }
     }
     spend(count * 4);

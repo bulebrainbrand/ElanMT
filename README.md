@@ -13,8 +13,8 @@ Dense 版は HF `MarianMTModel` とトークン単位で一致します。int8 /
 量子化重みで行い、tick ごとのバイト予算内で少しずつ進めます。
 
 **Bloxd runtime は TypedArray / ArrayBuffer / DataView / Buffer を使いません。**
-重みは `number[]` に 32bit word（4バイト）単位でパックし、41MB の重みを約10.25M要素で
-保持します。トークナイザも `number[]` と手書きの float32 デコードで動きます。
+重みは 32bit word（4バイト）単位の `number[]` にパックし、2MiB（524,288要素）ごとの
+`number[][]` に分割して保持します。41MB の重みを単一の巨大配列にはしません。トークナイザも `number[]` と手書きの float32 デコードで動きます。
 （Dense 版は Node/ブラウザ専用なので `Float32Array` を使っています。Bloxd bundle には
 含まれません。）
 
@@ -177,7 +177,7 @@ src/
     index.ts          int8 world code 入口（ストリーム）
     int4.ts           int4 world code 入口（起動時メモリロード）
     memory.ts         重みの一括ロードと in-memory 推論
-    memoryCursor.ts   32bit word の number[] による重みカーソル
+    memoryCursor.ts   32bit word の number[][] チャンクによる重みカーソル
     byteCursor.ts     safe8 を blockdata から読むカーソル（number[]）
     blockdata.ts      api.getBlockData / setBlockData ラッパー
     loadChunk.ts      未ロードチャンク待ち

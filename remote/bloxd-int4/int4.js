@@ -865,18 +865,21 @@ function addVectors(a, b) {
 	for (let i = 0; i < a.length; i++) out[i] = Math.fround(a[i] - -b[i]);
 	return out;
 }
-// src/bloxd/memoryCursor.ts
-/** Pack a byte-like sequence into 32-bit words. */
+const WORD_CHUNK_MASK = 524287;
+/** Pack a byte-like sequence into 32-bit word chunks. */
 function packBytesToWords(bytes) {
-	const words = new Array(Math.ceil(bytes.length / 4)).fill(0);
-	for (let i = 0; i < words.length; i++) {
-		const o = i * 4;
-		words[i] = (bytes[o] ?? 0) | (bytes[o + 1] ?? 0) << 8 | (bytes[o + 2] ?? 0) << 16 | (bytes[o + 3] ?? 0) << 24;
+	const words = [];
+	for (let i = 0; i < bytes.length; i += 4) {
+		const wordIndex = i >>> 2;
+		const chunkIndex = wordIndex >>> 19;
+		let chunk = words[chunkIndex];
+		if (chunk === void 0) {
+			chunk = [];
+			words[chunkIndex] = chunk;
+		}
+		chunk[wordIndex & WORD_CHUNK_MASK] = (bytes[i] ?? 0) | (bytes[i + 1] ?? 0) << 8 | (bytes[i + 2] ?? 0) << 16 | (bytes[i + 3] ?? 0) << 24;
 	}
 	return words;
-}
-function float32FromWord(word) {
-	return float32FromBits(word >>> 0);
 }
 function float32FromBits(bits) {
 	const sign = bits & 2147483648 ? -1 : 1;
@@ -889,10 +892,7 @@ function float32FromBits(bits) {
 	if (exponent === 255) return fraction === 0 ? sign * Infinity : NaN;
 	return sign * (1 + fraction * 2 ** -23) * 2 ** (exponent - 127);
 }
-function float32FromBytes(b0, b1, b2, b3) {
-	return float32FromBits((b0 | b1 << 8 | b2 << 16 | b3 << 24) >>> 0);
-}
-/** Weight source backed by 32-bit words (4 packed bytes) in a plain number[]. */
+/** Weight source backed by 32-bit words split into bounded number[] chunks. */
 var MemoryCursor = class {
 	words;
 	byteLength;
@@ -900,15 +900,19 @@ var MemoryCursor = class {
 		this.words = words;
 		this.byteLength = byteLength;
 	}
+	wordAt(wordIndex) {
+		const chunk = this.words[wordIndex >>> 19];
+		return chunk === void 0 ? 0 : chunk[wordIndex & WORD_CHUNK_MASK];
+	}
 	byteAt(index) {
-		return this.words[index >>> 2] >>> (index & 3) * 8 & 255;
+		return this.wordAt(index >>> 2) >>> (index & 3) * 8 & 255;
 	}
 	readBytesInto(out, tensorOffset, length, callback, outBase = 0, unsigned = false) {
 		if (length < 0 || outBase < 0 || length > out.length - outBase) throw new RangeError(`readBytesInto range [${outBase}, ${outBase + length}) exceeds buffer ${out.length}`);
 		if (tensorOffset < 0 || tensorOffset + length > this.byteLength) throw new RangeError(`readBytesInto range [${tensorOffset}, ${tensorOffset + length}) exceeds weights`);
 		let i = 0;
 		if ((tensorOffset & 3) === 0) for (; i + 4 <= length; i += 4) {
-			const word = this.words[tensorOffset + i >>> 2];
+			const word = this.wordAt(tensorOffset + i >>> 2);
 			const b0 = word & 255;
 			const b1 = word >>> 8 & 255;
 			const b2 = word >>> 16 & 255;
@@ -944,8 +948,11 @@ var MemoryCursor = class {
 		const values = new Array(count).fill(0);
 		for (let i = 0; i < count; i++) {
 			const o = tensorOffset + i * 4;
-			if ((o & 3) === 0) values[i] = float32FromWord(this.words[o >>> 2]);
-			else values[i] = float32FromBytes(this.byteAt(o), this.byteAt(o + 1), this.byteAt(o + 2), this.byteAt(o + 3));
+			if ((o & 3) === 0) values[i] = float32FromBits(this.wordAt(o >>> 2) >>> 0);
+			else {
+				const bits = (this.byteAt(o) | this.byteAt(o + 1) << 8 | this.byteAt(o + 2) << 16 | this.byteAt(o + 3) << 24) >>> 0;
+				values[i] = float32FromBits(bits);
+			}
 		}
 		spend(count * 4);
 		callback(values);
@@ -1370,9 +1377,11 @@ function loadTokenizer(cursor, weights, eosId, callback) {
 }
 // src/bloxd/memory.ts
 /** Read the whole weight stream into packed 32-bit words, one MiB per task. */
-function loadWeightsIntoMemory(cursor, totalLength, callback) {
-	const words = new Array(Math.ceil(totalLength / 4)).fill(0);
-	const chunkSize = 1048576;
+function loadWeightsIntoMemory(cursor, totalLengthOrWeights, callback) {
+	const totalLength = typeof totalLengthOrWeights === "number" ? totalLengthOrWeights : totalLengthOrWeights.totalLength ?? NaN;
+	if (!Number.isFinite(totalLength) || totalLength <= 0) throw new RangeError(`invalid weight length: ${String(totalLength)}`);
+	const words = [];
+	const chunkSize = 524288;
 	const temp = new Array(chunkSize).fill(0);
 	let offset = 0;
 	const next = () => {
@@ -1386,10 +1395,17 @@ function loadWeightsIntoMemory(cursor, totalLength, callback) {
 		cursor.readBytesInto(temp, start, length, () => {
 			const wordStart = start >>> 2;
 			for (let i = 0; i < length; i += 4) {
+				const wordIndex = wordStart + (i >>> 2);
+				const chunkIndex = wordIndex >>> 19;
+				let chunk = words[chunkIndex];
+				if (chunk === void 0) {
+					chunk = [];
+					words[chunkIndex] = chunk;
+				}
 				const b1 = i + 1 < length ? temp[i + 1] : 0;
 				const b2 = i + 2 < length ? temp[i + 2] : 0;
 				const b3 = i + 3 < length ? temp[i + 3] : 0;
-				words[wordStart + (i >>> 2)] = (temp[i] ?? 0) | b1 << 8 | b2 << 16 | b3 << 24;
+				chunk[wordIndex & WORD_CHUNK_MASK] = (temp[i] ?? 0) | b1 << 8 | b2 << 16 | b3 << 24;
 			}
 			queueTask(next);
 		}, 0, true);
