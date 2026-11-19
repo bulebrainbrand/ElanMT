@@ -13,7 +13,7 @@
 
 export const TASK_OVERHEAD = 1024;
 export const DEFAULT_TICK_BYTE_BUDGET = 8 * 1024 * 1024;
-export const DEFAULT_LOAD_BYTE_BUDGET = 1024 * 1024;
+export const DEFAULT_LOAD_BYTE_BUDGET = 256 * 1024;
 
 let tickByteBudget = DEFAULT_TICK_BYTE_BUDGET;
 let loadByteBudget = DEFAULT_LOAD_BYTE_BUDGET;

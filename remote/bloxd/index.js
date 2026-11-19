@@ -38,7 +38,7 @@ const update$1 = () => {
 */
 const TASK_OVERHEAD = 1024;
 const DEFAULT_TICK_BYTE_BUDGET = 8388608;
-const DEFAULT_LOAD_BYTE_BUDGET = 1048576;
+const DEFAULT_LOAD_BYTE_BUDGET = 262144;
 let tickByteBudget = DEFAULT_TICK_BYTE_BUDGET;
 let loadByteBudget = DEFAULT_LOAD_BYTE_BUDGET;
 let spent = 0;

@@ -58,7 +58,7 @@ function readData(pos, callback) {
 */
 const TASK_OVERHEAD = 1024;
 const DEFAULT_TICK_BYTE_BUDGET = 8388608;
-const DEFAULT_LOAD_BYTE_BUDGET = 1048576;
+const DEFAULT_LOAD_BYTE_BUDGET = 262144;
 let tickByteBudget = DEFAULT_TICK_BYTE_BUDGET;
 let loadByteBudget = DEFAULT_LOAD_BYTE_BUDGET;
 let spent = 0;
@@ -1380,7 +1380,7 @@ function loadWeightsAsStrings(cursor, totalLengthOrWeights, callback) {
 	const totalLength = typeof totalLengthOrWeights === "number" ? totalLengthOrWeights : totalLengthOrWeights.totalLength ?? NaN;
 	if (!Number.isFinite(totalLength) || totalLength <= 0) throw new RangeError(`invalid weight length: ${String(totalLength)}`);
 	const strings = [];
-	const chunkSize = 524288;
+	const chunkSize = 262144;
 	const temp = new Array(chunkSize).fill(0);
 	let offset = 0;
 	const next = () => {
