@@ -61,24 +61,39 @@ context.__callbacks = {
   },
 };
 
-const started = Date.now();
 vm.runInContext(code, context, { filename: bundlePath });
-vm.runInContext("think(__prompt, __callbacks, false, __maxNewTokens)", context, {
-  filename: "emulate-call.js",
-});
 
-let ticks = 0;
-while (context.__result === undefined && ticks < 10000) {
-  vm.runInContext("tick()", context, { filename: "emulate-tick.js" });
-  ticks++;
+function runOnce() {
+  context.__result = undefined;
+  context.__decoded = "";
+  const started = Date.now();
+  vm.runInContext("think(__prompt, __callbacks, false, __maxNewTokens)", context, {
+    filename: "emulate-call.js",
+  });
+  let ticks = 0;
+  while (context.__result === undefined && ticks < 10000) {
+    vm.runInContext("tick()", context, { filename: "emulate-tick.js" });
+    ticks++;
+  }
+  return { ticks, elapsedMs: Date.now() - started, result: context.__result ?? null };
 }
-const elapsedMs = Date.now() - started;
+
+const first = runOnce();
+const second = runOnce();
+const ticks = first.ticks;
+const elapsedMs = first.elapsedMs;
 
 const memory = process.memoryUsage();
 parentPort.postMessage({
   ticks,
   elapsedMs,
-  result: context.__result ?? null,
+  result: first.result,
+  first: { ticks: first.ticks, elapsedMs: first.elapsedMs },
+  second: {
+    ticks: second.ticks,
+    elapsedMs: second.elapsedMs,
+    result: second.result,
+  },
   memory: {
     rssMb: Math.round(memory.rss / 1024 / 1024),
     heapUsedMb: Math.round(memory.heapUsed / 1024 / 1024),

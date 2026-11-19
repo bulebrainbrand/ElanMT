@@ -141,21 +141,34 @@ function decodeUtf8(bytes) {
 * runtime does not provide them.
 */
 const WHITESPACE_RE = /[\t\n\v\f\r \u0085\u00a0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000]+/g;
+function readUint32LE(bytes, offset) {
+	return (bytes[offset] | bytes[offset + 1] << 8 | bytes[offset + 2] << 16 | bytes[offset + 3] << 24) >>> 0;
+}
+function readFloat32LE(bytes, offset) {
+	const bits = readUint32LE(bytes, offset);
+	const sign = bits & 2147483648 ? -1 : 1;
+	const exponent = bits >>> 23 & 255;
+	const fraction = bits & 8388607;
+	if (exponent === 0) {
+		if (fraction === 0) return sign === 1 ? 0 : -0;
+		return sign * fraction * 2 ** -149;
+	}
+	if (exponent === 255) return fraction === 0 ? sign * Infinity : NaN;
+	return sign * (1 + fraction * 2 ** -23) * 2 ** (exponent - 127);
+}
 var ProtobufReader = class {
 	bytes;
-	view;
 	offset = 0;
 	constructor(bytes) {
 		this.bytes = bytes;
-		this.view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
 	}
 	get done() {
-		return this.offset >= this.bytes.byteLength;
+		return this.offset >= this.bytes.length;
 	}
 	varint() {
 		let result = 0;
 		let shift = 0;
-		while (this.offset < this.bytes.byteLength) {
+		while (this.offset < this.bytes.length) {
 			const byte = this.bytes[this.offset++];
 			result += (byte & 127) * 2 ** shift;
 			if ((byte & 128) === 0) return result;
@@ -172,12 +185,12 @@ var ProtobufReader = class {
 		};
 	}
 	float32() {
-		const value = this.view.getFloat32(this.offset, true);
+		const value = readFloat32LE(this.bytes, this.offset);
 		this.offset += 4;
 		return value;
 	}
 	bytesField(length) {
-		const value = this.bytes.subarray(this.offset, this.offset + length);
+		const value = this.bytes.slice(this.offset, this.offset + length);
 		this.offset += length;
 		return value;
 	}
@@ -195,7 +208,7 @@ function parseNormalizerSpec(bytes) {
 	const reader = new ProtobufReader(bytes);
 	const spec = {
 		name: "nmt_nfkc",
-		charsmap: /* @__PURE__ */ new Uint8Array(0),
+		charsmap: [],
 		addDummyPrefix: true,
 		removeExtraWhitespaces: true,
 		escapeWhitespaces: true
@@ -251,7 +264,7 @@ function parseModel(bytes) {
 		pieces,
 		normalizer: normalizer ?? {
 			name: "nmt_nfkc",
-			charsmap: /* @__PURE__ */ new Uint8Array(0),
+			charsmap: [],
 			addDummyPrefix: true,
 			removeExtraWhitespaces: true,
 			escapeWhitespaces: true
@@ -268,18 +281,17 @@ var CharsMap = class CharsMap {
 	blob;
 	cache = /* @__PURE__ */ new Map();
 	constructor(charsmap) {
-		if (charsmap.byteLength < 4) {
-			this.units = /* @__PURE__ */ new Uint32Array(0);
-			this.blob = /* @__PURE__ */ new Uint8Array(0);
+		if (charsmap.length < 4) {
+			this.units = [];
+			this.blob = [];
 			return;
 		}
-		const view = new DataView(charsmap.buffer, charsmap.byteOffset, charsmap.byteLength);
-		const trieBytes = view.getUint32(0, true);
-		if (trieBytes % 4 !== 0 || 4 + trieBytes > charsmap.byteLength) throw new Error("sentencepiece: invalid normalization charsmap");
+		const trieBytes = readUint32LE(charsmap, 0);
+		if (trieBytes % 4 !== 0 || 4 + trieBytes > charsmap.length) throw new Error("sentencepiece: invalid normalization charsmap");
 		const unitCount = trieBytes / 4;
-		this.units = new Uint32Array(unitCount);
-		for (let i = 0; i < unitCount; i++) this.units[i] = view.getUint32(4 + i * 4, true);
-		this.blob = charsmap.subarray(4 + trieBytes);
+		this.units = new Array(unitCount);
+		for (let i = 0; i < unitCount; i++) this.units[i] = readUint32LE(charsmap, 4 + i * 4);
+		this.blob = charsmap.slice(4 + trieBytes);
 	}
 	static offset(unit) {
 		return unit >>> 10 << ((unit & 512) >>> 6) >>> 0;
@@ -288,8 +300,8 @@ var CharsMap = class CharsMap {
 		const cached = this.cache.get(valueOffset);
 		if (cached !== void 0) return cached;
 		let end = valueOffset;
-		while (end < this.blob.byteLength && this.blob[end] !== 0) end++;
-		const text = decodeUtf8(this.blob.subarray(valueOffset, end));
+		while (end < this.blob.length && this.blob[end] !== 0) end++;
+		const text = decodeUtf8(this.blob.slice(valueOffset, end));
 		this.cache.set(valueOffset, text);
 		return text;
 	}
@@ -302,11 +314,11 @@ var CharsMap = class CharsMap {
 		const output = [];
 		const { units } = this;
 		let i = 0;
-		while (i < input.byteLength) {
+		while (i < input.length) {
 			let pos = 0;
 			let matchLength = 0;
 			let value = -1;
-			for (let j = i; j < input.byteLength; j++) {
+			for (let j = i; j < input.length; j++) {
 				const byte = input[j];
 				const unit = units[pos];
 				if (unit === void 0) break;
@@ -329,11 +341,11 @@ var CharsMap = class CharsMap {
 			} else {
 				const lead = input[i];
 				const length = lead < 128 ? 1 : lead < 224 ? 2 : lead < 240 ? 3 : 4;
-				for (let k = 0; k < length && i + k < input.byteLength; k++) output.push(input[i + k]);
+				for (let k = 0; k < length && i + k < input.length; k++) output.push(input[i + k]);
 				i += length;
 			}
 		}
-		return new Uint8Array(output);
+		return output;
 	}
 };
 var SentencePieceTokenizer = class {
@@ -348,16 +360,16 @@ var SentencePieceTokenizer = class {
 	maxPieceLength;
 	charsMap;
 	normalizer;
-	constructor(spmBytes, eosId = 0, unkId = 1) {
-		const model = parseModel(spmBytes instanceof Uint8Array ? spmBytes : new Uint8Array(spmBytes));
+	constructor(bytes, eosId = 0, unkId = 1) {
+		const model = parseModel(bytes);
 		if (model.modelType !== 1) throw new Error(`sentencepiece: model type ${model.modelType} is not supported (only unigram)`);
 		this.eosId = eosId;
 		this.unkId = unkId;
 		this.normalizer = model.normalizer;
 		this.charsMap = new CharsMap(model.normalizer.charsmap);
 		this.pieces = model.pieces.map((p) => p.piece);
-		this.scores = new Float32Array(model.pieces.map((p) => p.score));
-		this.types = new Uint8Array(model.pieces.map((p) => p.type));
+		this.scores = model.pieces.map((p) => p.score);
+		this.types = model.pieces.map((p) => p.type);
 		const unkIndex = model.pieces.findIndex((p) => p.type === 2);
 		if (unkIndex >= 0) this.unkId = unkIndex;
 		let minScore = Infinity;
@@ -379,7 +391,7 @@ var SentencePieceTokenizer = class {
 	}
 	/** Equivalent to SentencePieceProcessor.normalize(). */
 	normalize(text) {
-		const raw = new Uint8Array(encodeUtf8(text));
+		const raw = encodeUtf8(text);
 		let normalized = decodeUtf8(this.charsMap.normalizeBytes(raw));
 		if (this.normalizer.removeExtraWhitespaces) normalized = normalized.replace(WHITESPACE_RE, " ").replace(/^ +| +$/g, "");
 		if (this.normalizer.addDummyPrefix && normalized.length > 0) normalized = " " + normalized;
@@ -392,9 +404,9 @@ var SentencePieceTokenizer = class {
 		const chars = Array.from(normalized);
 		const n = chars.length;
 		if (n === 0) return [];
-		const best = new Float64Array(n + 1).fill(-Infinity);
-		const backStart = new Int32Array(n + 1).fill(-1);
-		const backId = new Int32Array(n + 1).fill(-1);
+		const best = new Array(n + 1).fill(-Infinity);
+		const backStart = new Array(n + 1).fill(-1);
+		const backId = new Array(n + 1).fill(-1);
 		best[0] = 0;
 		for (let i = 0; i < n; i++) {
 			if (!Number.isFinite(best[i])) continue;
@@ -1089,7 +1101,7 @@ async function loadElanMT(source, options = {}) {
 		spm = source.spm;
 		weights = source.weights;
 	}
-	const tokenizer = new SentencePieceTokenizer(spm, config.eos_token_id ?? 0, 1);
+	const tokenizer = new SentencePieceTokenizer(spm instanceof Uint8Array ? Array.from(spm) : Array.from(new Uint8Array(spm)), config.eos_token_id ?? 0, 1);
 	const tensors = parseSafetensors(weights);
 	const model = new MarianModel(config, tensors);
 	return new ElanMT(config, tokenizer, model, options);

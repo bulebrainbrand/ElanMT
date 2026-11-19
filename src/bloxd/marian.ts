@@ -1,6 +1,6 @@
 /** Generator-friendly Marian encoder/decoder over int8 block-data weights. */
 
-import type { ByteCursor } from "./byteCursor";
+import type { WeightCursor } from "./byteCursor";
 import {
   computeLogits,
   linearInto,
@@ -75,11 +75,11 @@ export class BlockMarian {
   private encoderNorms: EncoderNormVectors[] = [];
   private decoderNorms: DecoderNormVectors[] = [];
 
-  private readonly encoderNormCache: (NormVectors | undefined)[] = [];
-  private readonly decoderNormCache: (NormVectors | undefined)[] = [];
+  private readonly encoderNormCache: Partial<EncoderNormVectors>[] = [];
+  private readonly decoderNormCache: Partial<DecoderNormVectors>[] = [];
 
   constructor(
-    readonly cursor: ByteCursor,
+    readonly cursor: WeightCursor,
     config: ModelConfig,
     weights: ModelWeights,
   ) {
@@ -132,13 +132,13 @@ export class BlockMarian {
       }
       tasks.push((done) =>
         this.loadNormPair(weights.selfAttnNorm, (norm) => {
-          this.encoderNormCache[layer] = { selfAttn: norm } as EncoderNormVectors;
+          this.encoderNormCache[layer] = { selfAttn: norm };
           done();
         }),
       );
       tasks.push((done) =>
         this.loadNormPair(weights.finalNorm, (norm) => {
-          const entry = this.encoderNormCache[layer] as EncoderNormVectors;
+          const entry = this.encoderNormCache[layer]!;
           entry.final = norm;
           done();
         }),
@@ -163,20 +163,20 @@ export class BlockMarian {
       }
       tasks.push((done) =>
         this.loadNormPair(weights.selfAttnNorm, (norm) => {
-          this.decoderNormCache[layer] = { selfAttn: norm } as DecoderNormVectors;
+          this.decoderNormCache[layer] = { selfAttn: norm };
           done();
         }),
       );
       tasks.push((done) =>
         this.loadNormPair(weights.encoderAttnNorm, (norm) => {
-          const entry = this.decoderNormCache[layer] as DecoderNormVectors;
+          const entry = this.decoderNormCache[layer]!;
           entry.encoderAttn = norm;
           done();
         }),
       );
       tasks.push((done) =>
         this.loadNormPair(weights.finalNorm, (norm) => {
-          const entry = this.decoderNormCache[layer] as DecoderNormVectors;
+          const entry = this.decoderNormCache[layer]!;
           entry.final = norm;
           done();
         }),
@@ -187,10 +187,19 @@ export class BlockMarian {
       this.encoderNorms = new Array(this.config.encoderLayers);
       this.decoderNorms = new Array(this.config.decoderLayers);
       for (let i = 0; i < this.config.encoderLayers; i++) {
-        this.encoderNorms[i] = this.encoderNormCache[i] as EncoderNormVectors;
+        const cached = this.encoderNormCache[i]!;
+        this.encoderNorms[i] = {
+          selfAttn: cached.selfAttn!,
+          final: cached.final!,
+        };
       }
       for (let i = 0; i < this.config.decoderLayers; i++) {
-        this.decoderNorms[i] = this.decoderNormCache[i] as DecoderNormVectors;
+        const cached = this.decoderNormCache[i]!;
+        this.decoderNorms[i] = {
+          selfAttn: cached.selfAttn!,
+          encoderAttn: cached.encoderAttn!,
+          final: cached.final!,
+        };
       }
       this.prepared = true;
       const callbacks = this.prepareCallbacks;
@@ -294,7 +303,7 @@ export class BlockMarian {
                 for (let i = 0; i < hidden[t].length; i++) hidden[t][i] = silu(hidden[t][i]);
               }
               this.linearWithBias(layer.fc2, hidden, ffn, () => {
-                const out = new Array<number>(length);
+                const out = new Array<number[]>(length);
                 for (let t = 0; t < length; t++) {
                   const next = new Array<number>(d).fill(0);
                   layerNormInto(

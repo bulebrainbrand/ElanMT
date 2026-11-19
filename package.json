@@ -8,7 +8,7 @@
   "type": "module",
   "main": "remote/index.js",
   "scripts": {
-    "build": "vp pack src/index.ts && vp pack src/bloxd/index.ts -d remote/bloxd",
+    "build": "vp pack src/index.ts && vp pack src/bloxd/index.ts -d remote/bloxd && vp pack src/bloxd/int4.ts -d remote/bloxd-int4",
     "build:dense": "vp pack src/index.ts",
     "build:world": "vp pack src/bloxd/index.ts -d remote/bloxd",
     "export:weights": "python scripts/export_blockdata.py",
@@ -17,12 +17,19 @@
     "export:blockdata": "npm run export:weights && npm run export:text && npm run export:schem",
     "infer": "node scripts/infer_ts.mjs",
     "check": "vp check",
-    "test": "node --test test/safe8.test.mjs test/blockdata.test.mjs",
-    "emulate": "node scripts/vm_emulate.mjs"
+    "test": "node --test --test-concurrency=1 test/safe8.test.mjs test/blockdata.test.mjs test/int4.test.mjs test/vm.test.mjs",
+    "emulate": "node scripts/vm_emulate.mjs",
+    "build:world:int4": "vp pack src/bloxd/int4.ts -d remote/bloxd-int4",
+    "export:int4": "python scripts/export_blockdata.py --bits 4 && node scripts/createSafe8Text.ts out/weights_int4.bin out/weights_int4_safe8.txt && node scripts/createWeightSchematics.ts out/weights_int4_safe8.txt schematics_int4 int4 elanmt-int4-weights",
+    "export:int4:weights": "python scripts/export_blockdata.py --bits 4",
+    "infer:int4": "node scripts/infer_int4.mjs",
+    "emulate:int4": "node scripts/vm_emulate.mjs --int4",
+    "test:vm": "node scripts/vm_emulate.mjs --int4 --assert"
   },
   "devDependencies": {
     "@bloxdjs/schematic": "^0.1.4",
     "@types/node": "^26.6.2",
+    "typescript": "^5.9.3",
     "vite-plus": "^1.7.0"
   }
 }

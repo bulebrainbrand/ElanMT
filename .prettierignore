@@ -1,5 +1,6 @@
 remote
 out
 schematics
+schematics_int4
 model
 pnpm-lock.yaml

@@ -5,7 +5,13 @@ export interface TensorMeta {
   offset: number;
   length: number;
   rows: number;
-  /** Index of this tensor's first row scale in the shared scale stream. */
+  cols?: number;
+  rowBytes?: number;
+  /** 8 for per-row int8, 4 for group-wise NF4. */
+  bits?: 4 | 8;
+  /** NF4 group width (0 for int8). */
+  groupSize?: number;
+  /** Index of this tensor's first scale in the shared scale stream. */
   scaleBase: number;
 }
 
@@ -45,10 +51,10 @@ export interface EncoderLayerWeights {
 
 export interface DecoderLayerWeights {
   selfAttn: AttentionWeights;
-  selfAttnNorm: LinearWeights;
+  selfAttnNorm: FloatLinearWeights;
   encoderAttn: AttentionWeights;
-  encoderAttnNorm: LinearWeights;
-  finalNorm: LinearWeights;
+  encoderAttnNorm: FloatLinearWeights;
+  finalNorm: FloatLinearWeights;
   fc1: LinearWeights;
   fc2: LinearWeights;
 }
@@ -78,4 +84,5 @@ export interface ModelWeights {
   finalLogitsBias: FloatTensorMeta;
   rowScales: FloatTensorMeta;
   tokenizer: { offset: number; length: number };
+  totalLength?: number;
 }

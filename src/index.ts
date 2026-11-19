@@ -369,7 +369,8 @@ export async function loadElanMT(
     weights = source.weights;
   }
 
-  const tokenizer = new SentencePieceTokenizer(spm, config.eos_token_id ?? 0, 1);
+  const spmBytes = spm instanceof Uint8Array ? Array.from(spm) : Array.from(new Uint8Array(spm));
+  const tokenizer = new SentencePieceTokenizer(spmBytes, config.eos_token_id ?? 0, 1);
   const tensors = parseSafetensors(weights);
   const model = new MarianModel(config, tensors);
   return new ElanMT(config, tokenizer, model, options);

@@ -91,6 +91,18 @@ function readData(pos, callback) {
 	waitLoadChunk(pos, () => callback(readText(pos)));
 }
 // src/bloxd/byteCursor.ts
+function readFloat32LE$1(bytes, offset) {
+	const bits = (bytes[offset] | bytes[offset + 1] << 8 | bytes[offset + 2] << 16 | bytes[offset + 3] << 24) >>> 0;
+	const sign = bits & 2147483648 ? -1 : 1;
+	const exponent = bits >>> 23 & 255;
+	const fraction = bits & 8388607;
+	if (exponent === 0) {
+		if (fraction === 0) return sign === 1 ? 0 : -0;
+		return sign * fraction * 2 ** -149;
+	}
+	if (exponent === 255) return fraction === 0 ? sign * Infinity : NaN;
+	return sign * (1 + fraction * 2 ** -23) * 2 ** (exponent - 127);
+}
 /**
 * Random-access reader over safe8 text stored in block data.
 *
@@ -180,15 +192,7 @@ var ByteCursor = class {
 	readFloats(tensorOffset, count, callback) {
 		this.readRawBytes(tensorOffset, count * 4, (bytes) => {
 			const values = new Array(count).fill(0);
-			const view = /* @__PURE__ */ new DataView(/* @__PURE__ */ new ArrayBuffer(4));
-			for (let i = 0; i < count; i++) {
-				const o = i * 4;
-				view.setUint8(0, bytes[o]);
-				view.setUint8(1, bytes[o + 1]);
-				view.setUint8(2, bytes[o + 2]);
-				view.setUint8(3, bytes[o + 3]);
-				values[i] = view.getFloat32(0, true);
-			}
+			for (let i = 0; i < count; i++) values[i] = readFloat32LE$1(bytes, i * 4);
 			callback(values);
 		});
 	}
@@ -2559,16 +2563,57 @@ function gemvRowsInto(raw, rawBase, scales, scaleBase, vec, inDim, out, outBase,
 		out[outBase - -o] = Math.fround(sum * scales[scaleBase - -o]);
 	}
 }
+/** QLoRA NF4 codebook, normalized to the per-group absmax. */
+const NF4 = [
+	-1,
+	-.6961928009986877,
+	-.5250730514526367,
+	-.39491748809814453,
+	-.28444138169288635,
+	-.18477343022823334,
+	-.09105003625154495,
+	0,
+	.07958029955625534,
+	.16093020141124725,
+	.24611230194568634,
+	.33791524171829224,
+	.44070982933044434,
+	.5626170039176941,
+	.7229568362236023,
+	1
+];
+function gemvInt4RowsInto(raw, rawBase, rowBytes, scales, scaleBase, groupsPerRow, groupSize, cols, vec, out, outBase, rowCount) {
+	for (let o = 0; o < rowCount; o++) {
+		const rowBase = rawBase + o * rowBytes;
+		const rowScaleBase = scaleBase + o * groupsPerRow;
+		let sum = 0;
+		for (let group = 0; group < groupsPerRow; group++) {
+			const scale = scales[rowScaleBase + group];
+			const start = group * groupSize;
+			const end = Math.min(start + groupSize, cols);
+			for (let i = start; i < end; i++) {
+				const byte = raw[rowBase + (i >> 1)];
+				const index = (i & 1) === 0 ? byte & 15 : byte >> 4;
+				sum += NF4[index] * scale * vec[i];
+			}
+		}
+		out[outBase + o] = Math.fround(sum);
+	}
+}
 /**
 * outs[t] = W * inputs[t] for every t. A tile of rows is decoded once and
 * multiplied by all inputs, so multi-token prefill shares the decode cost.
 */
 function linearInto(cursor, scales, weight, inputs, outs, callback) {
 	const outDim = weight.rows;
-	const inDim = Math.floor(weight.length / weight.rows);
-	if (inDim * outDim !== weight.length) throw new Error(`Tensor ${weight.name} is not a dense row matrix`);
+	const bits = weight.bits ?? 8;
+	const inDim = weight.cols ?? Math.floor(weight.length / weight.rows);
+	const rowBytes = weight.rowBytes ?? (bits === 4 ? Math.ceil(inDim / 2) : inDim);
+	const groupSize = weight.groupSize ?? 128;
+	const groupsPerRow = bits === 4 ? Math.ceil(inDim / groupSize) : 1;
+	if (outDim * rowBytes !== weight.length) throw new Error(`Tensor ${weight.name} is not a dense row matrix`);
 	if (inputs.length !== outs.length) throw new RangeError("linearInto expects one output per input");
-	const raw = scratch(Math.min(256, outDim) * inDim);
+	const raw = scratch(Math.min(256, outDim) * rowBytes);
 	let row = 0;
 	const processBatch = () => {
 		if (row >= outDim) {
@@ -2577,13 +2622,14 @@ function linearInto(cursor, scales, weight, inputs, outs, callback) {
 		}
 		const firstRow = row;
 		const rowCount = Math.min(256, outDim - row);
-		const rawLength = rowCount * inDim;
+		const rawLength = rowCount * rowBytes;
 		row += rowCount;
-		cursor.readBytesInto(raw, weight.offset + firstRow * inDim, rawLength, () => {
-			for (let t = 0; t < inputs.length; t++) gemvRowsInto(raw, 0, scales, weight.scaleBase + firstRow, inputs[t], inDim, outs[t], firstRow, rowCount);
+		cursor.readBytesInto(raw, weight.offset + firstRow * rowBytes, rawLength, () => {
+			for (let t = 0; t < inputs.length; t++) if (bits === 4) gemvInt4RowsInto(raw, 0, rowBytes, scales, weight.scaleBase + firstRow * groupsPerRow, groupsPerRow, groupSize, inDim, inputs[t], outs[t], firstRow, rowCount);
+			else gemvRowsInto(raw, 0, scales, weight.scaleBase + firstRow, inputs[t], inDim, outs[t], firstRow, rowCount);
 			if (inputs.length > 1) spend(Math.ceil(rawLength * (inputs.length - 1) * .15));
 			queueTask(processBatch);
-		});
+		}, 0, bits === 4);
 	};
 	processBatch();
 }
@@ -2591,11 +2637,15 @@ let logitsBuffer;
 /** Logits against the shared embedding matrix. */
 function computeLogits(cursor, scales, embed, hidden, callback) {
 	const vocab = embed.rows;
-	const dim = Math.floor(embed.length / embed.rows);
-	if (dim * vocab !== embed.length) throw new Error("Embedding tensor is not a dense row matrix");
+	const bits = embed.bits ?? 8;
+	const dim = embed.cols ?? Math.floor(embed.length / embed.rows);
+	const rowBytes = embed.rowBytes ?? (bits === 4 ? Math.ceil(dim / 2) : dim);
+	const groupSize = embed.groupSize ?? 128;
+	const groupsPerRow = bits === 4 ? Math.ceil(dim / groupSize) : 1;
+	if (vocab * rowBytes !== embed.length) throw new Error("Embedding tensor is not a dense row matrix");
 	if (logitsBuffer === void 0 || logitsBuffer.length !== vocab) logitsBuffer = new Array(vocab).fill(0);
 	const logits = logitsBuffer;
-	const raw = scratch(Math.min(512, vocab) * dim);
+	const raw = scratch(Math.min(512, vocab) * rowBytes);
 	let row = 0;
 	const processBatch = () => {
 		if (row >= vocab) {
@@ -2605,20 +2655,37 @@ function computeLogits(cursor, scales, embed, hidden, callback) {
 		const firstRow = row;
 		const rowCount = Math.min(512, vocab - row);
 		row += rowCount;
-		cursor.readBytesInto(raw, embed.offset + firstRow * dim, rowCount * dim, () => {
-			gemvRowsInto(raw, 0, scales, embed.scaleBase + firstRow, hidden, dim, logits, firstRow, rowCount);
+		cursor.readBytesInto(raw, embed.offset + firstRow * rowBytes, rowCount * rowBytes, () => {
+			if (bits === 4) gemvInt4RowsInto(raw, 0, rowBytes, scales, embed.scaleBase + firstRow * groupsPerRow, groupsPerRow, groupSize, dim, hidden, logits, firstRow, rowCount);
+			else gemvRowsInto(raw, 0, scales, embed.scaleBase + firstRow, hidden, dim, logits, firstRow, rowCount);
 			queueTask(processBatch);
-		});
+		}, 0, bits === 4);
 	};
 	processBatch();
 }
 function readRowDequantized(cursor, scales, tensor, row, callback) {
-	const dim = Math.floor(tensor.length / tensor.rows);
+	const bits = tensor.bits ?? 8;
+	const dim = tensor.cols ?? Math.floor(tensor.length / tensor.rows);
+	const rowBytes = tensor.rowBytes ?? (bits === 4 ? Math.ceil(dim / 2) : dim);
 	if (row < 0 || row >= tensor.rows) throw new RangeError(`Tensor ${tensor.name} row ${row} is out of range`);
-	cursor.readBytes(tensor.offset + row * dim, dim, (raw) => {
-		const scale = scales[tensor.scaleBase - -row];
-		const out = new Array(dim).fill(0);
-		for (let i = 0; i < dim; i++) out[i] = Math.fround(raw[i] * scale);
+	const out = new Array(dim).fill(0);
+	if (bits !== 4) {
+		cursor.readBytes(tensor.offset + row * rowBytes, dim, (raw) => {
+			const scale = scales[tensor.scaleBase - -row];
+			for (let i = 0; i < dim; i++) out[i] = Math.fround(raw[i] * scale);
+			callback(out);
+		});
+		return;
+	}
+	const groupSize = tensor.groupSize ?? 128;
+	const groupsPerRow = Math.ceil(dim / groupSize);
+	cursor.readRawBytes(tensor.offset + row * rowBytes, rowBytes, (raw) => {
+		const scaleBase = tensor.scaleBase + row * groupsPerRow;
+		for (let i = 0; i < dim; i++) {
+			const byte = raw[i >> 1];
+			const index = (i & 1) === 0 ? byte & 15 : byte >> 4;
+			out[i] = Math.fround(NF4[index] * scales[scaleBase + Math.floor(i / groupSize)]);
+		}
 		callback(out);
 	});
 }
@@ -2865,8 +2932,21 @@ var BlockMarian = class {
 		series(tasks, () => {
 			this.encoderNorms = new Array(this.config.encoderLayers);
 			this.decoderNorms = new Array(this.config.decoderLayers);
-			for (let i = 0; i < this.config.encoderLayers; i++) this.encoderNorms[i] = this.encoderNormCache[i];
-			for (let i = 0; i < this.config.decoderLayers; i++) this.decoderNorms[i] = this.decoderNormCache[i];
+			for (let i = 0; i < this.config.encoderLayers; i++) {
+				const cached = this.encoderNormCache[i];
+				this.encoderNorms[i] = {
+					selfAttn: cached.selfAttn,
+					final: cached.final
+				};
+			}
+			for (let i = 0; i < this.config.decoderLayers; i++) {
+				const cached = this.decoderNormCache[i];
+				this.decoderNorms[i] = {
+					selfAttn: cached.selfAttn,
+					encoderAttn: cached.encoderAttn,
+					final: cached.final
+				};
+			}
 			this.prepared = true;
 			const callbacks = this.prepareCallbacks;
 			this.prepareCallbacks = [];
@@ -3145,21 +3225,34 @@ function decodeUtf8(bytes) {
 * runtime does not provide them.
 */
 const WHITESPACE_RE = /[\t\n\v\f\r \u0085\u00a0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000]+/g;
+function readUint32LE(bytes, offset) {
+	return (bytes[offset] | bytes[offset + 1] << 8 | bytes[offset + 2] << 16 | bytes[offset + 3] << 24) >>> 0;
+}
+function readFloat32LE(bytes, offset) {
+	const bits = readUint32LE(bytes, offset);
+	const sign = bits & 2147483648 ? -1 : 1;
+	const exponent = bits >>> 23 & 255;
+	const fraction = bits & 8388607;
+	if (exponent === 0) {
+		if (fraction === 0) return sign === 1 ? 0 : -0;
+		return sign * fraction * 2 ** -149;
+	}
+	if (exponent === 255) return fraction === 0 ? sign * Infinity : NaN;
+	return sign * (1 + fraction * 2 ** -23) * 2 ** (exponent - 127);
+}
 var ProtobufReader = class {
 	bytes;
-	view;
 	offset = 0;
 	constructor(bytes) {
 		this.bytes = bytes;
-		this.view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
 	}
 	get done() {
-		return this.offset >= this.bytes.byteLength;
+		return this.offset >= this.bytes.length;
 	}
 	varint() {
 		let result = 0;
 		let shift = 0;
-		while (this.offset < this.bytes.byteLength) {
+		while (this.offset < this.bytes.length) {
 			const byte = this.bytes[this.offset++];
 			result += (byte & 127) * 2 ** shift;
 			if ((byte & 128) === 0) return result;
@@ -3176,12 +3269,12 @@ var ProtobufReader = class {
 		};
 	}
 	float32() {
-		const value = this.view.getFloat32(this.offset, true);
+		const value = readFloat32LE(this.bytes, this.offset);
 		this.offset += 4;
 		return value;
 	}
 	bytesField(length) {
-		const value = this.bytes.subarray(this.offset, this.offset + length);
+		const value = this.bytes.slice(this.offset, this.offset + length);
 		this.offset += length;
 		return value;
 	}
@@ -3199,7 +3292,7 @@ function parseNormalizerSpec(bytes) {
 	const reader = new ProtobufReader(bytes);
 	const spec = {
 		name: "nmt_nfkc",
-		charsmap: /* @__PURE__ */ new Uint8Array(0),
+		charsmap: [],
 		addDummyPrefix: true,
 		removeExtraWhitespaces: true,
 		escapeWhitespaces: true
@@ -3255,7 +3348,7 @@ function parseModel(bytes) {
 		pieces,
 		normalizer: normalizer ?? {
 			name: "nmt_nfkc",
-			charsmap: /* @__PURE__ */ new Uint8Array(0),
+			charsmap: [],
 			addDummyPrefix: true,
 			removeExtraWhitespaces: true,
 			escapeWhitespaces: true
@@ -3272,18 +3365,17 @@ var CharsMap = class CharsMap {
 	blob;
 	cache = /* @__PURE__ */ new Map();
 	constructor(charsmap) {
-		if (charsmap.byteLength < 4) {
-			this.units = /* @__PURE__ */ new Uint32Array(0);
-			this.blob = /* @__PURE__ */ new Uint8Array(0);
+		if (charsmap.length < 4) {
+			this.units = [];
+			this.blob = [];
 			return;
 		}
-		const view = new DataView(charsmap.buffer, charsmap.byteOffset, charsmap.byteLength);
-		const trieBytes = view.getUint32(0, true);
-		if (trieBytes % 4 !== 0 || 4 + trieBytes > charsmap.byteLength) throw new Error("sentencepiece: invalid normalization charsmap");
+		const trieBytes = readUint32LE(charsmap, 0);
+		if (trieBytes % 4 !== 0 || 4 + trieBytes > charsmap.length) throw new Error("sentencepiece: invalid normalization charsmap");
 		const unitCount = trieBytes / 4;
-		this.units = new Uint32Array(unitCount);
-		for (let i = 0; i < unitCount; i++) this.units[i] = view.getUint32(4 + i * 4, true);
-		this.blob = charsmap.subarray(4 + trieBytes);
+		this.units = new Array(unitCount);
+		for (let i = 0; i < unitCount; i++) this.units[i] = readUint32LE(charsmap, 4 + i * 4);
+		this.blob = charsmap.slice(4 + trieBytes);
 	}
 	static offset(unit) {
 		return unit >>> 10 << ((unit & 512) >>> 6) >>> 0;
@@ -3292,8 +3384,8 @@ var CharsMap = class CharsMap {
 		const cached = this.cache.get(valueOffset);
 		if (cached !== void 0) return cached;
 		let end = valueOffset;
-		while (end < this.blob.byteLength && this.blob[end] !== 0) end++;
-		const text = decodeUtf8(this.blob.subarray(valueOffset, end));
+		while (end < this.blob.length && this.blob[end] !== 0) end++;
+		const text = decodeUtf8(this.blob.slice(valueOffset, end));
 		this.cache.set(valueOffset, text);
 		return text;
 	}
@@ -3306,11 +3398,11 @@ var CharsMap = class CharsMap {
 		const output = [];
 		const { units } = this;
 		let i = 0;
-		while (i < input.byteLength) {
+		while (i < input.length) {
 			let pos = 0;
 			let matchLength = 0;
 			let value = -1;
-			for (let j = i; j < input.byteLength; j++) {
+			for (let j = i; j < input.length; j++) {
 				const byte = input[j];
 				const unit = units[pos];
 				if (unit === void 0) break;
@@ -3333,11 +3425,11 @@ var CharsMap = class CharsMap {
 			} else {
 				const lead = input[i];
 				const length = lead < 128 ? 1 : lead < 224 ? 2 : lead < 240 ? 3 : 4;
-				for (let k = 0; k < length && i + k < input.byteLength; k++) output.push(input[i + k]);
+				for (let k = 0; k < length && i + k < input.length; k++) output.push(input[i + k]);
 				i += length;
 			}
 		}
-		return new Uint8Array(output);
+		return output;
 	}
 };
 var SentencePieceTokenizer = class {
@@ -3352,16 +3444,16 @@ var SentencePieceTokenizer = class {
 	maxPieceLength;
 	charsMap;
 	normalizer;
-	constructor(spmBytes, eosId = 0, unkId = 1) {
-		const model = parseModel(spmBytes instanceof Uint8Array ? spmBytes : new Uint8Array(spmBytes));
+	constructor(bytes, eosId = 0, unkId = 1) {
+		const model = parseModel(bytes);
 		if (model.modelType !== 1) throw new Error(`sentencepiece: model type ${model.modelType} is not supported (only unigram)`);
 		this.eosId = eosId;
 		this.unkId = unkId;
 		this.normalizer = model.normalizer;
 		this.charsMap = new CharsMap(model.normalizer.charsmap);
 		this.pieces = model.pieces.map((p) => p.piece);
-		this.scores = new Float32Array(model.pieces.map((p) => p.score));
-		this.types = new Uint8Array(model.pieces.map((p) => p.type));
+		this.scores = model.pieces.map((p) => p.score);
+		this.types = model.pieces.map((p) => p.type);
 		const unkIndex = model.pieces.findIndex((p) => p.type === 2);
 		if (unkIndex >= 0) this.unkId = unkIndex;
 		let minScore = Infinity;
@@ -3383,7 +3475,7 @@ var SentencePieceTokenizer = class {
 	}
 	/** Equivalent to SentencePieceProcessor.normalize(). */
 	normalize(text) {
-		const raw = new Uint8Array(encodeUtf8(text));
+		const raw = encodeUtf8(text);
 		let normalized = decodeUtf8(this.charsMap.normalizeBytes(raw));
 		if (this.normalizer.removeExtraWhitespaces) normalized = normalized.replace(WHITESPACE_RE, " ").replace(/^ +| +$/g, "");
 		if (this.normalizer.addDummyPrefix && normalized.length > 0) normalized = " " + normalized;
@@ -3396,9 +3488,9 @@ var SentencePieceTokenizer = class {
 		const chars = Array.from(normalized);
 		const n = chars.length;
 		if (n === 0) return [];
-		const best = new Float64Array(n + 1).fill(-Infinity);
-		const backStart = new Int32Array(n + 1).fill(-1);
-		const backId = new Int32Array(n + 1).fill(-1);
+		const best = new Array(n + 1).fill(-Infinity);
+		const backStart = new Array(n + 1).fill(-1);
+		const backId = new Array(n + 1).fill(-1);
 		best[0] = 0;
 		for (let i = 0; i < n; i++) {
 			if (!Number.isFinite(best[i])) continue;
@@ -3471,9 +3563,7 @@ function loadTokenizer(cursor, weights, eosId, callback) {
 		return;
 	}
 	cursor.readRawBytes(weights.tokenizer.offset, weights.tokenizer.length, (bytes) => {
-		const data = new Uint8Array(bytes.length);
-		for (let i = 0; i < bytes.length; i++) data[i] = bytes[i];
-		tokenizer = new SentencePieceTokenizer(data, eosId, 1);
+		tokenizer = new SentencePieceTokenizer(bytes, eosId, 1);
 		callback(tokenizer);
 	});
 }

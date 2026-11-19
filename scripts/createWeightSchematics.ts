@@ -13,8 +13,10 @@ import {
   SLOT_SPACING,
 } from "../src/bloxd/constants.ts";
 
-const INPUT_PATH = "./out/weights_safe8.txt";
-const OUTPUT_DIR = "./schematics";
+const INPUT_PATH = process.argv[2] ?? "./out/weights_safe8.txt";
+const OUTPUT_DIR = process.argv[3] ?? "./schematics";
+const PREFIX = process.argv[4] ?? "weights";
+const SCHEMATIC_NAME = process.argv[5] ?? "elanmt-weights";
 
 const createBlockDataStr = (text: string) =>
   JSON.stringify({
@@ -65,7 +67,7 @@ for (let index = 0; index < codeBlockCount; index++) {
 }
 
 const schematic: LongestNormailedSchema = {
-  name: "elanmt-weights",
+  name: SCHEMATIC_NAME,
   size,
   pos: [0, 0, 0],
   chunks,
@@ -91,7 +93,7 @@ splitSchematicByAxis(schematic, 32 * 5, "x")
   .map(LongestSchema.schemaObjectToBuffer)
   .forEach((buffer, index) => {
     const suffix = String(index).padStart(3, "0");
-    writeFileSync(`${OUTPUT_DIR}/weights_${suffix}.bloxdschem`, buffer);
+    writeFileSync(`${OUTPUT_DIR}/${PREFIX}_${suffix}.bloxdschem`, buffer);
   });
 
 console.log(`wrote ${Math.ceil(spatialChunkCount / 5)} schematics to ${OUTPUT_DIR}`);

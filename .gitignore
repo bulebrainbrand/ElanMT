@@ -2,3 +2,7 @@ model
 node_modules
 out
 schematics
+schematics_int4
+.tmp_*
+scripts/_*
+scripts/verify_int4.mjs

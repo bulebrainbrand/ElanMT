@@ -2,8 +2,8 @@
 import { closeSync, mkdirSync, openSync, readFileSync, writeSync } from "node:fs";
 import { dirname } from "node:path";
 
-const INPUT_PATH = "./out/weights_int8.bin";
-const OUTPUT_PATH = "./out/weights_safe8.txt";
+const INPUT_PATH = process.argv[2] ?? "./out/weights_int8.bin";
+const OUTPUT_PATH = process.argv[3] ?? "./out/weights_safe8.txt";
 
 const rawBytes = readFileSync(INPUT_PATH);
 mkdirSync(dirname(OUTPUT_PATH), { recursive: true });

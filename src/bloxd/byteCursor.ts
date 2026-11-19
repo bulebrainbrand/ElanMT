@@ -1,6 +1,39 @@
 import { readData } from "./blockdata";
 import { spend } from "./eventLoop";
 
+function readFloat32LE(bytes: number[], offset: number): number {
+  const bits =
+    (bytes[offset] |
+      (bytes[offset + 1] << 8) |
+      (bytes[offset + 2] << 16) |
+      (bytes[offset + 3] << 24)) >>>
+    0;
+  const sign = bits & 0x80000000 ? -1 : 1;
+  const exponent = (bits >>> 23) & 0xff;
+  const fraction = bits & 0x7fffff;
+  if (exponent === 0) {
+    if (fraction === 0) return sign === 1 ? 0 : -0;
+    return sign * fraction * 2 ** -149;
+  }
+  if (exponent === 255) return fraction === 0 ? sign * Infinity : Number.NaN;
+  return sign * (1 + fraction * 2 ** -23) * 2 ** (exponent - 127);
+}
+
+/** The read surface shared by block-data and in-memory weight sources. */
+export interface WeightCursor {
+  readBytesInto(
+    out: number[],
+    tensorOffset: number,
+    length: number,
+    callback: () => void,
+    outBase?: number,
+    unsigned?: boolean,
+  ): void;
+  readBytes(tensorOffset: number, length: number, callback: (bytes: number[]) => void): void;
+  readRawBytes(tensorOffset: number, length: number, callback: (bytes: number[]) => void): void;
+  readFloats(tensorOffset: number, count: number, callback: (values: number[]) => void): void;
+}
+
 /**
  * Random-access reader over safe8 text stored in block data.
  *
@@ -8,7 +41,7 @@ import { spend } from "./eventLoop";
  * readData defers the callback and the event loop resumes on a later tick.
  * Every completed read reports its decoded byte count to the tick budget.
  */
-export class ByteCursor {
+export class ByteCursor implements WeightCursor {
   readonly chunkSize: number;
   readonly coordFn: (index: number) => [number, number, number];
   chunkIndex = -1;
@@ -120,15 +153,8 @@ export class ByteCursor {
   readFloats(tensorOffset: number, count: number, callback: (values: number[]) => void): void {
     this.readRawBytes(tensorOffset, count * 4, (bytes) => {
       const values = new Array<number>(count).fill(0);
-      const buffer = new ArrayBuffer(4);
-      const view = new DataView(buffer);
       for (let i = 0; i < count; i++) {
-        const o = i * 4;
-        view.setUint8(0, bytes[o]);
-        view.setUint8(1, bytes[o + 1]);
-        view.setUint8(2, bytes[o + 2]);
-        view.setUint8(3, bytes[o + 3]);
-        values[i] = view.getFloat32(0, true);
+        values[i] = readFloat32LE(bytes, i * 4);
       }
       callback(values);
     });

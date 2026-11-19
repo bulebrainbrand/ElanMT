@@ -1,6 +1,6 @@
 /** Int8 weight streaming and matrix-vector kernels. */
 
-import type { ByteCursor } from "./byteCursor";
+import type { WeightCursor } from "./byteCursor";
 import { queueTask, spend } from "./eventLoop";
 import type { FloatTensorMeta, TensorMeta } from "./types";
 
@@ -46,12 +46,52 @@ function gemvRowsInto(
   }
 }
 
+/** QLoRA NF4 codebook, normalized to the per-group absmax. */
+export const NF4: number[] = [
+  -1.0, -0.6961928009986877, -0.5250730514526367, -0.39491748809814453, -0.28444138169288635,
+  -0.18477343022823334, -0.09105003625154495, 0.0, 0.07958029955625534, 0.16093020141124725,
+  0.24611230194568634, 0.33791524171829224, 0.44070982933044434, 0.5626170039176941,
+  0.7229568362236023, 1.0,
+];
+
+function gemvInt4RowsInto(
+  raw: number[],
+  rawBase: number,
+  rowBytes: number,
+  scales: number[],
+  scaleBase: number,
+  groupsPerRow: number,
+  groupSize: number,
+  cols: number,
+  vec: number[],
+  out: number[],
+  outBase: number,
+  rowCount: number,
+): void {
+  for (let o = 0; o < rowCount; o++) {
+    const rowBase = rawBase + o * rowBytes;
+    const rowScaleBase = scaleBase + o * groupsPerRow;
+    let sum = 0;
+    for (let group = 0; group < groupsPerRow; group++) {
+      const scale = scales[rowScaleBase + group];
+      const start = group * groupSize;
+      const end = Math.min(start + groupSize, cols);
+      for (let i = start; i < end; i++) {
+        const byte = raw[rowBase + (i >> 1)];
+        const index = (i & 1) === 0 ? byte & 15 : byte >> 4;
+        sum += NF4[index] * scale * vec[i];
+      }
+    }
+    out[outBase + o] = Math.fround(sum);
+  }
+}
+
 /**
  * outs[t] = W * inputs[t] for every t. A tile of rows is decoded once and
  * multiplied by all inputs, so multi-token prefill shares the decode cost.
  */
 export function linearInto(
-  cursor: ByteCursor,
+  cursor: WeightCursor,
   scales: number[],
   weight: TensorMeta,
   inputs: number[][],
@@ -59,8 +99,12 @@ export function linearInto(
   callback: () => void,
 ): void {
   const outDim = weight.rows;
-  const inDim = Math.floor(weight.length / weight.rows);
-  if (inDim * outDim !== weight.length) {
+  const bits = weight.bits ?? 8;
+  const inDim = weight.cols ?? Math.floor(weight.length / weight.rows);
+  const rowBytes = weight.rowBytes ?? (bits === 4 ? Math.ceil(inDim / 2) : inDim);
+  const groupSize = weight.groupSize ?? 128;
+  const groupsPerRow = bits === 4 ? Math.ceil(inDim / groupSize) : 1;
+  if (outDim * rowBytes !== weight.length) {
     throw new Error(`Tensor ${weight.name} is not a dense row matrix`);
   }
   if (inputs.length !== outs.length) {
@@ -68,7 +112,7 @@ export function linearInto(
   }
 
   const maxRows = Math.min(LINEAR_ROW_BATCH, outDim);
-  const raw = scratch(maxRows * inDim);
+  const raw = scratch(maxRows * rowBytes);
   let row = 0;
 
   const processBatch = (): void => {
@@ -78,28 +122,52 @@ export function linearInto(
     }
     const firstRow = row;
     const rowCount = Math.min(LINEAR_ROW_BATCH, outDim - row);
-    const rawLength = rowCount * inDim;
+    const rawLength = rowCount * rowBytes;
     row += rowCount;
 
-    cursor.readBytesInto(raw, weight.offset + firstRow * inDim, rawLength, () => {
-      for (let t = 0; t < inputs.length; t++) {
-        gemvRowsInto(
-          raw,
-          0,
-          scales,
-          weight.scaleBase + firstRow,
-          inputs[t],
-          inDim,
-          outs[t],
-          firstRow,
-          rowCount,
-        );
-      }
-      if (inputs.length > 1) {
-        spend(Math.ceil(rawLength * (inputs.length - 1) * 0.15));
-      }
-      queueTask(processBatch);
-    });
+    cursor.readBytesInto(
+      raw,
+      weight.offset + firstRow * rowBytes,
+      rawLength,
+      () => {
+        for (let t = 0; t < inputs.length; t++) {
+          if (bits === 4) {
+            gemvInt4RowsInto(
+              raw,
+              0,
+              rowBytes,
+              scales,
+              weight.scaleBase + firstRow * groupsPerRow,
+              groupsPerRow,
+              groupSize,
+              inDim,
+              inputs[t],
+              outs[t],
+              firstRow,
+              rowCount,
+            );
+          } else {
+            gemvRowsInto(
+              raw,
+              0,
+              scales,
+              weight.scaleBase + firstRow,
+              inputs[t],
+              inDim,
+              outs[t],
+              firstRow,
+              rowCount,
+            );
+          }
+        }
+        if (inputs.length > 1) {
+          spend(Math.ceil(rawLength * (inputs.length - 1) * 0.15));
+        }
+        queueTask(processBatch);
+      },
+      0,
+      bits === 4,
+    );
   };
 
   processBatch();
@@ -109,15 +177,19 @@ let logitsBuffer: number[] | undefined;
 
 /** Logits against the shared embedding matrix. */
 export function computeLogits(
-  cursor: ByteCursor,
+  cursor: WeightCursor,
   scales: number[],
   embed: TensorMeta,
   hidden: number[],
   callback: (logits: number[]) => void,
 ): void {
   const vocab = embed.rows;
-  const dim = Math.floor(embed.length / embed.rows);
-  if (dim * vocab !== embed.length) {
+  const bits = embed.bits ?? 8;
+  const dim = embed.cols ?? Math.floor(embed.length / embed.rows);
+  const rowBytes = embed.rowBytes ?? (bits === 4 ? Math.ceil(dim / 2) : dim);
+  const groupSize = embed.groupSize ?? 128;
+  const groupsPerRow = bits === 4 ? Math.ceil(dim / groupSize) : 1;
+  if (vocab * rowBytes !== embed.length) {
     throw new Error("Embedding tensor is not a dense row matrix");
   }
   if (logitsBuffer === undefined || logitsBuffer.length !== vocab) {
@@ -125,7 +197,7 @@ export function computeLogits(
   }
   const logits = logitsBuffer;
   const maxRows = Math.min(LOGIT_ROW_BATCH, vocab);
-  const raw = scratch(maxRows * dim);
+  const raw = scratch(maxRows * rowBytes);
   let row = 0;
 
   const processBatch = (): void => {
@@ -137,48 +209,86 @@ export function computeLogits(
     const rowCount = Math.min(LOGIT_ROW_BATCH, vocab - row);
     row += rowCount;
 
-    cursor.readBytesInto(raw, embed.offset + firstRow * dim, rowCount * dim, () => {
-      gemvRowsInto(
-        raw,
-        0,
-        scales,
-        embed.scaleBase + firstRow,
-        hidden,
-        dim,
-        logits,
-        firstRow,
-        rowCount,
-      );
-      queueTask(processBatch);
-    });
+    cursor.readBytesInto(
+      raw,
+      embed.offset + firstRow * rowBytes,
+      rowCount * rowBytes,
+      () => {
+        if (bits === 4) {
+          gemvInt4RowsInto(
+            raw,
+            0,
+            rowBytes,
+            scales,
+            embed.scaleBase + firstRow * groupsPerRow,
+            groupsPerRow,
+            groupSize,
+            dim,
+            hidden,
+            logits,
+            firstRow,
+            rowCount,
+          );
+        } else {
+          gemvRowsInto(
+            raw,
+            0,
+            scales,
+            embed.scaleBase + firstRow,
+            hidden,
+            dim,
+            logits,
+            firstRow,
+            rowCount,
+          );
+        }
+        queueTask(processBatch);
+      },
+      0,
+      bits === 4,
+    );
   };
 
   processBatch();
 }
 
 export function readRowDequantized(
-  cursor: ByteCursor,
+  cursor: WeightCursor,
   scales: number[],
   tensor: TensorMeta,
   row: number,
   callback: (values: number[]) => void,
 ): void {
-  const dim = Math.floor(tensor.length / tensor.rows);
+  const bits = tensor.bits ?? 8;
+  const dim = tensor.cols ?? Math.floor(tensor.length / tensor.rows);
+  const rowBytes = tensor.rowBytes ?? (bits === 4 ? Math.ceil(dim / 2) : dim);
   if (row < 0 || row >= tensor.rows) {
     throw new RangeError(`Tensor ${tensor.name} row ${row} is out of range`);
   }
-  cursor.readBytes(tensor.offset + row * dim, dim, (raw) => {
-    const scale = scales[tensor.scaleBase - -row];
-    const out = new Array<number>(dim).fill(0);
+  const out = new Array<number>(dim).fill(0);
+  if (bits !== 4) {
+    cursor.readBytes(tensor.offset + row * rowBytes, dim, (raw) => {
+      const scale = scales[tensor.scaleBase - -row];
+      for (let i = 0; i < dim; i++) out[i] = Math.fround(raw[i] * scale);
+      callback(out);
+    });
+    return;
+  }
+  const groupSize = tensor.groupSize ?? 128;
+  const groupsPerRow = Math.ceil(dim / groupSize);
+  cursor.readRawBytes(tensor.offset + row * rowBytes, rowBytes, (raw) => {
+    const scaleBase = tensor.scaleBase + row * groupsPerRow;
     for (let i = 0; i < dim; i++) {
-      out[i] = Math.fround(raw[i] * scale);
+      const byte = raw[i >> 1];
+      const index = (i & 1) === 0 ? byte & 15 : byte >> 4;
+      out[i] = Math.fround(NF4[index] * scales[scaleBase + Math.floor(i / groupSize)]);
     }
     callback(out);
   });
 }
 
 export function readFloatVector(
-  cursor: ByteCursor,
+  cursor: WeightCursor,
   tensor: FloatTensorMeta,
   callback: (values: number[]) => void,
 ): void {
@@ -186,7 +296,7 @@ export function readFloatVector(
 }
 
 export function readVectorDequantized(
-  cursor: ByteCursor,
+  cursor: WeightCursor,
   scales: number[],
   tensor: TensorMeta,
   callback: (values: number[]) => void,
@@ -195,7 +305,7 @@ export function readVectorDequantized(
 }
 
 export function cachedVector(
-  cursor: ByteCursor,
+  cursor: WeightCursor,
   scales: number[],
   tensor: TensorMeta,
   getCached: () => number[] | undefined,
