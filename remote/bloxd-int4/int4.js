@@ -1397,6 +1397,7 @@ function loadWeightsAsStrings(cursor, totalLengthOrWeights, callback) {
 	const temp = new Array(chunkSize).fill(0);
 	let offset = 0;
 	const next = () => {
+		
 		if (offset >= totalLength) {
 			callback(new StringCursor(strings, totalLength));
 			return;
