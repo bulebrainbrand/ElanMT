@@ -1376,6 +1376,7 @@ function loadTokenizer(cursor, weights, eosId, callback) {
 }
 // src/bloxd/memory.ts
 /** Read the whole stream into Latin-1 string chunks, one buffer per task. */
+const DISCARD = true; 
 function loadWeightsAsStrings(cursor, totalLengthOrWeights, callback) {
 	const totalLength = typeof totalLengthOrWeights === "number" ? totalLengthOrWeights : totalLengthOrWeights.totalLength ?? NaN;
 	if (!Number.isFinite(totalLength) || totalLength <= 0) throw new RangeError(`invalid weight length: ${String(totalLength)}`);
@@ -1384,6 +1385,7 @@ function loadWeightsAsStrings(cursor, totalLengthOrWeights, callback) {
 	const temp = new Array(chunkSize).fill(0);
 	let offset = 0;
 	const next = () => {
+		
 		if (offset >= totalLength) {
 			callback(new StringCursor(strings, totalLength));
 			return;
@@ -1393,9 +1395,9 @@ function loadWeightsAsStrings(cursor, totalLengthOrWeights, callback) {
 		const start = offset;
 		offset += length;
 		cursor.readBytesInto(temp, start, length, () => {
-			strings.push(bytesToLatin1(temp, length));
-			spendLoad(length);
-			queueTask(next);
+  if (!DISCARD) strings.push(bytesToPacked(temp, length));
+  spendLoad(length);
+  queueTask(next);
 		}, 0, true);
 	};
 	next();
