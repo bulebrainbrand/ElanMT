@@ -2,32 +2,40 @@ import type { WeightCursor } from "./byteCursor";
 import { spend } from "./eventLoop";
 
 /**
- * One-byte strings are a compact weight source on V8: char codes 0..255 use
- * one byte per character, and random access is charCodeAt(). Chunking keeps
- * every string small and the byte offset math to a shift.
+ * Weights are packed two bytes per UTF-16 code unit: (hi << 8) | lo, where the
+ * even byte offset is hi and the odd one is lo. On an engine that stores
+ * strings as two bytes per character this halves memory compared to one byte
+ * per character; on V8 (which would have used one-byte strings) it costs the
+ * same. Chunking keeps every string small and the byte offset math to a shift.
+ * Each chunk holds STRING_CHUNK_SIZE bytes, i.e. STRING_CHUNK_SIZE / 2 chars.
  */
-export const STRING_CHUNK_SHIFT = 19;
+export const STRING_CHUNK_SHIFT = 18;
 export const STRING_CHUNK_SIZE = 1 << STRING_CHUNK_SHIFT;
 const STRING_CHUNK_MASK = STRING_CHUNK_SIZE - 1;
 const BUILD_PART = 8192;
 
-/** Decode 0..255 bytes into a flat Latin-1 string. */
-export function bytesToLatin1(bytes: ArrayLike<number>, length = bytes.length, start = 0): string {
+/** Pack 0..255 bytes two per char. An odd trailing byte is padded with lo = 0. */
+export function bytesToPacked(bytes: ArrayLike<number>, length = bytes.length, start = 0): string {
   const parts: string[] = [];
-  for (let i = 0; i < length; i += BUILD_PART) {
-    const end = Math.min(i + BUILD_PART, length);
+  const step = BUILD_PART * 2;
+  for (let i = 0; i < length; i += step) {
+    const end = Math.min(i + step, length);
     const sub: number[] = [];
-    for (let j = i; j < end; j++) sub.push(bytes[start + j] ?? 0);
+    for (let j = i; j < end; j += 2) {
+      const hi = (bytes[start + j] ?? 0) & 0xff;
+      const lo = j + 1 < end ? (bytes[start + j + 1] ?? 0) & 0xff : 0;
+      sub.push((hi << 8) | lo);
+    }
     parts.push(String.fromCharCode.apply(null, sub));
   }
   return parts.join("");
 }
 
-/** Convert a raw byte array into bounded Latin-1 strings. */
+/** Convert a raw byte array into bounded packed strings. */
 export function bytesToStrings(bytes: ArrayLike<number>): string[] {
   const strings: string[] = [];
   for (let offset = 0; offset < bytes.length; offset += STRING_CHUNK_SIZE) {
-    strings.push(bytesToLatin1(bytes, Math.min(STRING_CHUNK_SIZE, bytes.length - offset), offset));
+    strings.push(bytesToPacked(bytes, Math.min(STRING_CHUNK_SIZE, bytes.length - offset), offset));
   }
   return strings;
 }
@@ -44,7 +52,7 @@ function float32FromBits(bits: number): number {
   return sign * (1 + fraction * 2 ** -23) * 2 ** (exponent - 127);
 }
 
-/** Weight source backed by Latin-1 strings. */
+/** Weight source backed by strings packing two bytes per char. */
 export class StringCursor implements WeightCursor {
   readonly strings: string[];
   readonly byteLength: number;
@@ -56,7 +64,9 @@ export class StringCursor implements WeightCursor {
 
   private byteAt(offset: number): number {
     const chunk = this.strings[offset >>> STRING_CHUNK_SHIFT];
-    return chunk === undefined ? 0 : chunk.charCodeAt(offset & STRING_CHUNK_MASK);
+    if (chunk === undefined) return 0;
+    const c = chunk.charCodeAt((offset & STRING_CHUNK_MASK) >>> 1);
+    return offset & 1 ? c & 0xff : c >>> 8;
   }
 
   readBytesInto(
@@ -89,7 +99,9 @@ export class StringCursor implements WeightCursor {
       const local = absolute & STRING_CHUNK_MASK;
       const run = Math.min(length - i, STRING_CHUNK_SIZE - local);
       for (let j = 0; j < run; j++) {
-        const byte = chunk.charCodeAt(local + j);
+        const p = local + j;
+        const c = chunk.charCodeAt(p >>> 1);
+        const byte = p & 1 ? c & 0xff : c >>> 8;
         out[outBase + i + j] = unsigned ? byte : (byte << 24) >> 24;
       }
       i += run;

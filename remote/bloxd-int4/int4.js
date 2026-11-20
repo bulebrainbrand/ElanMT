@@ -878,16 +878,21 @@ function addVectors(a, b) {
 	for (let i = 0; i < a.length; i++) out[i] = Math.fround(a[i] - -b[i]);
 	return out;
 }
-const STRING_CHUNK_SIZE = 1 << 19;
-const STRING_CHUNK_MASK = 524287;
+const STRING_CHUNK_SIZE = 1 << 18;
+const STRING_CHUNK_MASK = 262143;
 const BUILD_PART = 8192;
-/** Decode 0..255 bytes into a flat Latin-1 string. */
-function bytesToLatin1(bytes, length = bytes.length, start = 0) {
+/** Pack 0..255 bytes two per char. An odd trailing byte is padded with lo = 0. */
+function bytesToPacked(bytes, length = bytes.length, start = 0) {
 	const parts = [];
-	for (let i = 0; i < length; i += BUILD_PART) {
-		const end = Math.min(i + BUILD_PART, length);
+	const step = BUILD_PART * 2;
+	for (let i = 0; i < length; i += step) {
+		const end = Math.min(i + step, length);
 		const sub = [];
-		for (let j = i; j < end; j++) sub.push(bytes[start + j] ?? 0);
+		for (let j = i; j < end; j += 2) {
+			const hi = (bytes[start + j] ?? 0) & 255;
+			const lo = j + 1 < end ? (bytes[start + j + 1] ?? 0) & 255 : 0;
+			sub.push(hi << 8 | lo);
+		}
 		parts.push(String.fromCharCode.apply(null, sub));
 	}
 	return parts.join("");
@@ -903,7 +908,7 @@ function float32FromBits(bits) {
 	if (exponent === 255) return fraction === 0 ? sign * Infinity : NaN;
 	return sign * (1 + fraction * 2 ** -23) * 2 ** (exponent - 127);
 }
-/** Weight source backed by Latin-1 strings. */
+/** Weight source backed by strings packing two bytes per char. */
 var StringCursor = class {
 	strings;
 	byteLength;
@@ -912,8 +917,10 @@ var StringCursor = class {
 		this.byteLength = byteLength;
 	}
 	byteAt(offset) {
-		const chunk = this.strings[offset >>> 19];
-		return chunk === void 0 ? 0 : chunk.charCodeAt(offset & STRING_CHUNK_MASK);
+		const chunk = this.strings[offset >>> 18];
+		if (chunk === void 0) return 0;
+		const c = chunk.charCodeAt((offset & STRING_CHUNK_MASK) >>> 1);
+		return offset & 1 ? c & 255 : c >>> 8;
 	}
 	readBytesInto(out, tensorOffset, length, callback, outBase = 0, unsigned = false) {
 		if (length < 0 || outBase < 0 || length > out.length - outBase) throw new RangeError(`readBytesInto range [${outBase}, ${outBase + length}) exceeds buffer ${out.length}`);
@@ -921,7 +928,7 @@ var StringCursor = class {
 		let i = 0;
 		while (i < length) {
 			const absolute = tensorOffset + i;
-			const chunkIndex = absolute >>> 19;
+			const chunkIndex = absolute >>> 18;
 			const chunk = this.strings[chunkIndex];
 			if (chunk === void 0) {
 				for (; i < length; i++) out[outBase + i] = 0;
@@ -930,7 +937,9 @@ var StringCursor = class {
 			const local = absolute & STRING_CHUNK_MASK;
 			const run = Math.min(length - i, STRING_CHUNK_SIZE - local);
 			for (let j = 0; j < run; j++) {
-				const byte = chunk.charCodeAt(local + j);
+				const p = local + j;
+				const c = chunk.charCodeAt(p >>> 1);
+				const byte = p & 1 ? c & 255 : c >>> 8;
 				out[outBase + i + j] = unsigned ? byte : byte << 24 >> 24;
 			}
 			i += run;
@@ -1375,12 +1384,16 @@ function loadTokenizer(cursor, weights, eosId, callback) {
 	});
 }
 // src/bloxd/memory.ts
-/** Read the whole stream into Latin-1 string chunks, one buffer per task. */
+/**
+* Read the whole stream into packed string chunks (two bytes per char), one
+* buffer per task. The task size must equal STRING_CHUNK_SIZE so that every
+* pushed string lines up with StringCursor's chunk indexing.
+*/
 function loadWeightsAsStrings(cursor, totalLengthOrWeights, callback) {
 	const totalLength = typeof totalLengthOrWeights === "number" ? totalLengthOrWeights : totalLengthOrWeights.totalLength ?? NaN;
 	if (!Number.isFinite(totalLength) || totalLength <= 0) throw new RangeError(`invalid weight length: ${String(totalLength)}`);
 	const strings = [];
-	const chunkSize = 262144;
+	const chunkSize = STRING_CHUNK_SIZE;
 	const temp = new Array(chunkSize).fill(0);
 	let offset = 0;
 	const next = () => {
@@ -1393,7 +1406,7 @@ function loadWeightsAsStrings(cursor, totalLengthOrWeights, callback) {
 		const start = offset;
 		offset += length;
 		cursor.readBytesInto(temp, start, length, () => {
-			strings.push(bytesToLatin1(temp, length));
+			strings.push(bytesToPacked(temp, length));
 			spendLoad(length);
 			queueTask(next);
 		}, 0, true);

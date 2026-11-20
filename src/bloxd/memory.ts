@@ -3,7 +3,7 @@ import { queueTask, spendLoad, update as updateEventLoop } from "./eventLoop";
 import { translateBlock } from "./generate";
 import { BlockMarian } from "./marian";
 import { MemoryCursor, WORD_CHUNK_MASK, WORD_CHUNK_SHIFT } from "./memoryCursor";
-import { StringCursor, bytesToLatin1, bytesToStrings } from "./stringCursor";
+import { STRING_CHUNK_SIZE, StringCursor, bytesToPacked, bytesToStrings } from "./stringCursor";
 import { loadTokenizer } from "./tokenizerBlock";
 import type { ModelConfig, ModelWeights } from "./types";
 
@@ -12,7 +12,11 @@ export interface MemoryCallbacks {
   onComplete?: (tokens: number[], promptLength: number, text: string) => void;
 }
 
-/** Read the whole stream into Latin-1 string chunks, one buffer per task. */
+/**
+ * Read the whole stream into packed string chunks (two bytes per char), one
+ * buffer per task. The task size must equal STRING_CHUNK_SIZE so that every
+ * pushed string lines up with StringCursor's chunk indexing.
+ */
 export function loadWeightsAsStrings(
   cursor: WeightCursor,
   totalLengthOrWeights: number | ModelWeights,
@@ -26,7 +30,7 @@ export function loadWeightsAsStrings(
     throw new RangeError(`invalid weight length: ${String(totalLength)}`);
   }
   const strings: string[] = [];
-  const chunkSize = 256 * 1024;
+  const chunkSize = STRING_CHUNK_SIZE;
   const temp = new Array<number>(chunkSize).fill(0);
   let offset = 0;
   const next = (): void => {
@@ -43,7 +47,7 @@ export function loadWeightsAsStrings(
       start,
       length,
       () => {
-        strings.push(bytesToLatin1(temp, length));
+        strings.push(bytesToPacked(temp, length));
         spendLoad(length);
         queueTask(next);
       },
